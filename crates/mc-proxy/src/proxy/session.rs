@@ -31,6 +31,7 @@ use crate::proxy::backend;
 use crate::proxy::status::build_status;
 use crate::proxy::ClusterMessage;
 use crate::proxy::Shared;
+use crate::servers::Server;
 use crate::sockets::{OwnedReadHalf, OwnedWriteHalf, TcpStream};
 
 /// Errors that terminate a session.
@@ -200,7 +201,14 @@ async fn handle_status(
             if let Err(err) =
                 passthrough_status(&mut reader, &mut writer, &shared, &handshake).await
             {
-                warn!(%peer, error = %err, "status passthrough failed; answering locally");
+                let server = shared.servers.default_server();
+                warn!(
+                    %peer,
+                    server = %server.name,
+                    protocol = handshake.protocol_version,
+                    error = %err,
+                    "status passthrough failed; answering locally"
+                );
                 let json = build_status(&shared, handshake.protocol_version);
                 writer
                     .write_packet(
@@ -234,39 +242,95 @@ async fn passthrough_status(
     handshake: &Handshake,
 ) -> Result<(), SessionError> {
     let server = shared.servers.default_server();
-    let (mut backend_reader, mut backend_writer) =
-        backend::open(server, shared.config.backend_timeout())
-            .await
-            .map_err(|err| SessionError::Backend(err.to_string()))?;
+    let backend_timeout = shared.config.backend_timeout();
+    let (mut backend_reader, mut backend_writer, response) =
+        match open_status_backend(server, handshake, backend_timeout).await {
+            Ok(result) => result,
+            Err(first) => {
+                // A backend may close a status connection transiently (restart,
+                // throttle, load balancer). One retry avoids falling back to
+                // the local status for a single dropped connection.
+                debug!(
+                    server = %server.name,
+                    error = %first,
+                    "status passthrough failed; retrying once"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                open_status_backend(server, handshake, backend_timeout).await?
+            }
+        };
+    writer.write_packet(response.id, &response.data).await?;
+
+    // From here on the client already has the passthrough status response.
+    // If the backend disappears while relaying the ping, answer the ping
+    // locally instead of making the caller send a *second* status response
+    // (which corrupts the status stream for the client).
+    let ping = match read_timeout(reader, shared.config.handshake_timeout(), "ping").await {
+        Ok(ping) => ping,
+        Err(_) => return Ok(()),
+    };
+    if ping.id != PING_REQUEST_ID {
+        return Ok(());
+    }
+
+    let relayed = async {
+        backend_writer.write_packet(ping.id, &ping.data).await?;
+        let pong = timeout(
+            shared.config.backend_timeout(),
+            backend_reader.read_packet(),
+        )
+        .await
+        .map_err(|_| SessionError::Timeout("backend pong"))??;
+        writer.write_packet(pong.id, &pong.data).await?;
+        Ok::<(), SessionError>(())
+    }
+    .await;
+
+    if relayed.is_err() {
+        // Paper/backends may close the status connection right after the
+        // response, or a throttled connection may be dropped. Echo the ping
+        // so the client still receives a valid pong.
+        debug!(
+            server = %server.name,
+            "backend pong unavailable; answering ping locally"
+        );
+        let payload = status::decode_ping(&ping)?;
+        writer
+            .write_packet(status::PONG_RESPONSE_ID, &status::encode_pong(payload))
+            .await?;
+    }
+    Ok(())
+}
+
+async fn open_status_backend(
+    server: &Server,
+    handshake: &Handshake,
+    backend_timeout: Duration,
+) -> Result<
+    (
+        FrameReader<OwnedReadHalf>,
+        FrameWriter<OwnedWriteHalf>,
+        Packet,
+    ),
+    SessionError,
+> {
+    let (mut reader, mut writer) = backend::open(server, backend_timeout)
+        .await
+        .map_err(|err| SessionError::Backend(err.to_string()))?;
     let status_handshake = Handshake {
         protocol_version: handshake.protocol_version,
         server_address: handshake.server_address.clone(),
         server_port: handshake.server_port,
         next_state: NextState::Status,
     };
-    backend_writer
+    writer
         .write_packet(HANDSHAKE_ID, &status_handshake.encode().into_inner())
         .await?;
-    backend_writer.write_packet(STATUS_REQUEST_ID, &[]).await?;
-    let response = timeout(
-        shared.config.backend_timeout(),
-        backend_reader.read_packet(),
-    )
-    .await
-    .map_err(|_| SessionError::Timeout("backend status response"))??;
-    writer.write_packet(response.id, &response.data).await?;
-
-    // Relay the ping/pong so the latency shown to the client is real.
-    let ping = read_timeout(reader, shared.config.handshake_timeout(), "ping").await?;
-    backend_writer.write_packet(ping.id, &ping.data).await?;
-    let pong = timeout(
-        shared.config.backend_timeout(),
-        backend_reader.read_packet(),
-    )
-    .await
-    .map_err(|_| SessionError::Timeout("backend pong"))??;
-    writer.write_packet(pong.id, &pong.data).await?;
-    Ok(())
+    writer.write_packet(STATUS_REQUEST_ID, &[]).await?;
+    let response = timeout(backend_timeout, reader.read_packet())
+        .await
+        .map_err(|_| SessionError::Timeout("backend status response"))??;
+    Ok((reader, writer, response))
 }
 
 fn valid_username(name: &str) -> bool {

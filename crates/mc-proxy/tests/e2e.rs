@@ -293,6 +293,117 @@ servers = ["lobby"]
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn passthrough_status_retries_once_when_backend_drops() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        // First connection: close immediately.
+        let (first, _) = listener.accept().await.unwrap();
+        drop(first);
+        // Retry: answer the status request.
+        let (second, _) = listener.accept().await.unwrap();
+        let (read_half, write_half) = second.into_split();
+        let mut reader = FrameReader::new(read_half);
+        let mut writer = FrameWriter::new(write_half);
+        let handshake = Handshake::decode(&read_packet(&mut reader).await).unwrap();
+        assert_eq!(handshake.next_state, NextState::Status);
+        let request = read_packet(&mut reader).await;
+        assert_eq!(request.id, status::STATUS_REQUEST_ID);
+        let json = r#"{"version":{"name":"retry-ok","protocol":770},"players":{"max":7,"online":0},"description":{"text":"retried"}}"#;
+        write_packet(
+            &mut writer,
+            status::STATUS_RESPONSE_ID,
+            &status::encode_status_response(json),
+        )
+        .await;
+    });
+
+    let config = format!(
+        r#"
+bind = "127.0.0.1:0"
+[status]
+mode = "passthrough"
+
+[[servers]]
+name = "lobby"
+address = "{backend_addr}"
+"#
+    );
+    let (addr, _shared, task) = spawn_proxy(&config).await;
+    let mut client = TestClient::connect(addr, "localhost", NextState::Status).await;
+    client.send(status::STATUS_REQUEST_ID, &[]).await;
+    let response = client.read().await;
+    assert_eq!(response.id, status::STATUS_RESPONSE_ID);
+    let mut reader = response.reader();
+    let json: serde_json::Value =
+        serde_json::from_str(&reader.read_string(32767).unwrap()).unwrap();
+    assert_eq!(json["description"]["text"], "retried");
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn passthrough_status_answers_ping_locally_if_backend_closes() {
+    // A backend that replies to the status request and then closes before the
+    // ping. The proxy must still answer the client's ping with a pong, and
+    // must not send a second status response.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read_half, write_half) = stream.into_split();
+        let mut reader = FrameReader::new(read_half);
+        let mut writer = FrameWriter::new(write_half);
+        let handshake = Handshake::decode(&read_packet(&mut reader).await).unwrap();
+        assert_eq!(handshake.next_state, NextState::Status);
+        let request = read_packet(&mut reader).await;
+        assert_eq!(request.id, status::STATUS_REQUEST_ID);
+        let json = r#"{"version":{"name":"passthrough","protocol":770},"players":{"max":7,"online":3},"description":{"text":"from backend"}}"#;
+        write_packet(
+            &mut writer,
+            status::STATUS_RESPONSE_ID,
+            &status::encode_status_response(json),
+        )
+        .await;
+        // Close immediately: no pong from the backend.
+        drop(reader);
+        drop(writer);
+    });
+
+    let config = format!(
+        r#"
+bind = "127.0.0.1:0"
+[status]
+mode = "passthrough"
+
+[[servers]]
+name = "lobby"
+address = "{backend_addr}"
+"#
+    );
+    let (addr, _shared, task) = spawn_proxy(&config).await;
+    let mut client = TestClient::connect(addr, "localhost", NextState::Status).await;
+    client.send(status::STATUS_REQUEST_ID, &[]).await;
+    let response = client.read().await;
+    assert_eq!(response.id, status::STATUS_RESPONSE_ID);
+    let mut reader = response.reader();
+    let json: serde_json::Value =
+        serde_json::from_str(&reader.read_string(32767).unwrap()).unwrap();
+    assert_eq!(json["description"]["text"], "from backend");
+
+    client
+        .send(status::PING_REQUEST_ID, &status::encode_pong(4321))
+        .await;
+    let pong = client.read().await;
+    assert_eq!(
+        pong.id,
+        status::PONG_RESPONSE_ID,
+        "a duplicate status response must not be sent"
+    );
+    assert_eq!(status::decode_ping(&pong).unwrap(), 4321);
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn offline_login_forwards_identity_and_relays() {
     let backend = spawn_backend(256).await;
     let config = format!(
