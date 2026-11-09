@@ -25,7 +25,8 @@ CPU Core 0                                  CPU Core 1
 - `WorkerConfig { id, core, eal_args }` で起動（`tokio_fstack::spawn_worker`）。
 - 各 worker は**独立したリアクター**を持ちます。
   - 標準バックエンド: 専用の epoll インスタンス + driver スレッド。
-  - F-Stack バックエンド: 専用のスタックスレッド（`ff_init` + `ff_run`）。
+  - F-Stack バックエンド: 1 スタック構成のため `workers > 1` は非対応
+    （メインスレッドで `ff_init`/`ff_run`、アプリは別スレッド）。
 - worker のスレッドでは `current_thread` ランタイムが動き、そのスレッドの
   スレッドローカルにリアクターが束縛されます。`TcpListener::bind` などの
   ソケット生成は**その worker のリアクター**に登録されます。
@@ -96,11 +97,13 @@ thread_mode=1
 各 lcore スレッドは `ff_stack_thread_init(cpuid)` で自分のスタックを初期化し、
 RX/TX キューと fd テーブルを持ちます。まさにこのドキュメントの図の形です。
 
-**現状の `tokio-fstack` の F-Stack バックエンド**は、ワーカーごとに
-`ff_init`/`ff_run` を呼ぶ 1 スタック構成のため、native-mt の N スタックを
-そのままは利用できません。native-mt 対応には、`ff_run` の tick コールバックを
-lcore ごとに識別し、lcore ごとのキュー・epoll・Waker をディスパッチする
-拡張が必要です（[8. 制限](#8-制限と今後の課題)）。
+**現状の `tokio-fstack` の F-Stack バックエンド**は 1 プロセス 1 スタック
+構成です。メインスレッドが `ff_init` と `ff_run` を実行し、プロキシの
+Tokio ランタイムは別スレッドで動いて syscall をキュー経由でメインスレッドに
+渡します（`tokio_fstack::run_with_stack`）。native-mt の N スタックを
+そのまま利用するには、`ff_run` の tick コールバックを lcore ごとに識別し、
+lcore ごとのキュー・epoll・Waker をディスパッチする拡張が必要です
+（[8. 制限](#8-制限と今後の課題)）。
 
 ### 4.2 マルチプロセス（`thread_mode=0`、現行 F-Stack）
 
@@ -169,8 +172,8 @@ worker スレッド（runtime, core にピン留め）
         ├─ accept loop
         ├─ セッションタスク
         └─ bus consumer
-reactor / stack スレッド（同じ core にピン留め可能）
-  ├─ epoll_wait（標準） / ff_run（F-Stack）
+reactor / F-Stack スレッド（同じ core にピン留め可能）
+  ├─ epoll_wait（標準） / ff_run（F-Stack、メインスレッド）
   └─ ソケット syscall の実行（F-Stack の場合）
 ```
 
@@ -189,9 +192,9 @@ reactor / stack スレッド（同じ core にピン留め可能）
 
 ## 8. 制限と今後の課題
 
-- **F-Stack native-mt の直接対応**: 現在は 1 プロセス 1 スタック。
-  `ff_run` の per-lcore tick ディスパッチを実装すると、1 プロセスで
-  N スタックを扱えます。
+- **F-Stack native-mt の直接対応**: 現在は 1 プロセス 1 スタックで、
+  `ff_init`/`ff_run` はメインスレッドが所有します。`ff_run` の per-lcore
+  tick ディスパッチを実装すると、1 プロセスで N スタックを扱えます。
 - **マルチプロセス間の WorkerBus**: 現在のリングバッファは同一プロセス内。
   DPDK `rte_ring`（共有 hugepage）版を追加すると、マルチプロセス
   デプロイでもプレイヤー状態を共有できます。

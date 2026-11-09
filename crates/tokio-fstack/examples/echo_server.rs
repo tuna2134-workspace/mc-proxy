@@ -14,12 +14,21 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_fstack::{Config, TcpListener, TcpStream, UdpSocket};
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
     // Everything after the executable name is passed to ff_init (ignored by
-    // the standard backend).
+    // the standard backend). run_with_stack keeps ff_init/ff_run on the main
+    // thread, which F-Stack requires.
     let eal_args: Vec<String> = std::env::args().skip(1).collect();
-    tokio_fstack::init(Config::default().with_eal_args(eal_args))?;
+    let config = Config::default().with_eal_args(eal_args);
+    tokio_fstack::run_with_stack(config, || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(server_main())
+    })
+}
+
+async fn server_main() -> std::io::Result<()> {
     eprintln!("backend: {}", tokio_fstack::backend());
 
     let tcp = TcpListener::bind("0.0.0.0:7000").await?;

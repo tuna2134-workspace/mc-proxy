@@ -11,11 +11,18 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_fstack::{Config, TcpStream, UdpSocket};
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
     let eal_args: Vec<String> = std::env::args().skip(1).collect();
-    tokio_fstack::init(Config::default().with_eal_args(eal_args))?;
+    let config = Config::default().with_eal_args(eal_args);
+    tokio_fstack::run_with_stack(config, || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(client_main())
+    })
+}
 
+async fn client_main() -> std::io::Result<()> {
     let mut tcp = TcpStream::connect("127.0.0.1:7000").await?;
     tcp.set_nodelay(true)?;
     let payload = b"hello over tokio-fstack";

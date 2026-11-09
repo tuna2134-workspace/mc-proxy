@@ -185,7 +185,7 @@ impl UdpSocket {
     /// Poll a datagram send.
     ///
     /// The payload is copied into an internal staging buffer so that dropping
-    /// the future cannot leave the stack thread writing into caller memory.
+    /// the future cannot leave the F-Stack thread writing into caller memory.
     pub fn poll_send_to(
         &self,
         cx: &mut Context<'_>,

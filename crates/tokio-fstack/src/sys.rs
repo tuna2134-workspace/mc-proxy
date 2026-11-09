@@ -393,6 +393,7 @@ mod imp {
     // `linux_sockaddr` in ff_api.h is layout-compatible with `libc::sockaddr`.
     extern "C" {
         pub(crate) fn ff_init(argc: c_int, argv: *const *const libc::c_char) -> c_int;
+        fn ff_stop_run();
         pub(crate) fn ff_run(
             callback: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
             arg: *mut c_void,
@@ -680,6 +681,12 @@ mod imp {
         }
     }
 
+    /// Ask the F-Stack main loop to stop (thread-safe).
+    pub(crate) fn stop_run() {
+        // SAFETY: `ff_stop_run` only sets a stop flag in the F-Stack loop.
+        unsafe { ff_stop_run() }
+    }
+
     /// Initialise the F-Stack data plane with the given EAL arguments.
     ///
     /// Must be called on the thread that will later run [`ff_run`], which is
@@ -725,4 +732,4 @@ pub(crate) use imp::{
     getsockopt_int, listen, recv, recv_from, send, send_to, setsockopt_int, shutdown, socket,
 };
 #[cfg(feature = "fstack")]
-pub(crate) use imp::{cstrings, init, run};
+pub(crate) use imp::{cstrings, init, run, stop_run};

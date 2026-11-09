@@ -46,12 +46,13 @@
 //! ## F-Stack threading model
 //!
 //! F-Stack is a single-threaded network stack: only the thread that called
-//! `ff_init`/`ff_run` may call `ff_*` functions. Tokio, on the other hand, runs
-//! tasks on a thread pool. This crate bridges the two models by keeping one
-//! dedicated thread that owns the F-Stack instance and executes *every*
-//! socket syscall and epoll update on it (see `reactor.rs`). Async tasks only
-//! submit operations and await wake-ups; no F-Stack function is ever called
-//! from a Tokio worker thread.
+//! `ff_init`/`ff_run` may call `ff_*` functions, and those calls must happen
+//! on the process main thread. Tokio, on the other hand, runs tasks on a
+//! thread pool. This crate bridges the two models with [`run_with_stack`]:
+//! `ff_init` runs on the main thread, the application (Tokio runtime) runs on
+//! a dedicated thread, and *every* socket syscall and epoll update is queued
+//! back to the main thread's `ff_run` loop (see `reactor.rs`). No F-Stack
+//! function is ever called from a Tokio worker thread.
 //!
 //! The trade-off is one cross-thread hand-off per I/O operation. For a
 //! connection-oriented proxy this is far below the packet-processing cost of
@@ -134,11 +135,70 @@ impl Config {
     }
 }
 
+/// Initialise F-Stack and create the socket reactor on the **calling
+/// thread**.
+///
+/// F-Stack's `ff_init` must run on the process main thread. Call
+/// [`run_fstack_loop`] afterwards on the same thread; application/proxy code
+/// runs on another thread and submits socket operations through the reactor
+/// queue. [`run_with_stack`] does this for you.
+#[cfg(feature = "fstack")]
+pub fn init_fstack(config: Config) -> io::Result<()> {
+    reactor::init_fstack(config)
+}
+
+/// Run the F-Stack event loop on the calling thread until it is stopped.
+///
+/// Must be called on the same thread as [`init_fstack`].
+#[cfg(feature = "fstack")]
+pub fn run_fstack_loop() -> io::Result<()> {
+    reactor::run_fstack_loop()
+}
+
+/// Initialise the socket backend and run `app`.
+///
+/// * Standard backend: starts the reactor and calls `app` on the current
+///   thread.
+/// * F-Stack backend: calls `ff_init` on the current (main) thread, spawns
+///   `app` on a dedicated thread, and then runs `ff_run` on the current
+///   thread. When `app` returns, the event loop is stopped and the result is
+///   propagated.
+///
+/// This is the recommended entry point for F-Stack applications, because
+/// `ff_init`/`ff_run` must not be called from a worker thread.
+pub fn run_with_stack<F>(config: Config, app: F) -> io::Result<()>
+where
+    F: FnOnce() -> io::Result<()> + Send + 'static,
+{
+    #[cfg(feature = "fstack")]
+    {
+        init_fstack(config)?;
+        let worker = std::thread::Builder::new()
+            .name("mc-proxy-app".to_owned())
+            .spawn(move || {
+                let result = app();
+                reactor::stop_fstack_loop();
+                result
+            })?;
+        run_fstack_loop()?;
+        match worker.join() {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::other("application thread panicked")),
+        }
+    }
+    #[cfg(not(feature = "fstack"))]
+    {
+        init(config)?;
+        app()
+    }
+}
+
 /// Initialise the socket backend.
 ///
-/// For the F-Stack backend this starts the dedicated stack thread, calls
-/// `ff_init` on it and then enters `ff_run`. It is idempotent; only the first
-/// call has an effect.
+/// For the F-Stack backend this is only valid after [`init_fstack`], because
+/// `ff_init`/`ff_run` must run on the process main thread; prefer
+/// [`run_with_stack`], which sets this up correctly. It is idempotent; only the
+/// first call has an effect.
 ///
 /// On the standard backend this starts the readiness driver thread and ignores
 /// [`Config::eal_args`].

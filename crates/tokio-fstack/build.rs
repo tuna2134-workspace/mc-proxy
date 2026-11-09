@@ -48,6 +48,22 @@ fn main() {
         }
     }
 
+    // F-Stack keeps its boot hooks in ELF linker-set sections. The default
+    // `--gc-sections` drops sections referenced only by weak __start_/__stop_
+    // symbols, so keep all sections.
+    println!("cargo:rustc-link-arg=-Wl,--no-gc-sections");
+
+    // F-Stack's DPDK glue calls the bonding PMD directly (PMDs are not part
+    // of libdpdk-libs) and rte_timer_meta_init, which only exists in the
+    // static timer archive.
+    println!("cargo:rustc-link-lib=dylib=rte_net_bond");
+    println!("cargo:rustc-link-lib=static=rte_timer");
+    // PMDs used by vdev-based test setups (net_tap / null). Linking the shared
+    // objects also registers them with the EAL driver registry.
+    for lib in ["rte_net_tap", "rte_net_null", "rte_net_ring"] {
+        println!("cargo:rustc-link-lib=dylib={lib}");
+    }
+
     for lib in ["rt", "m", "dl", "crypto", "z", "pthread", "numa"] {
         println!("cargo:rustc-link-lib={lib}");
     }

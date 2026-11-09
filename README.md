@@ -66,11 +66,18 @@ DPDK 上のユーザー空間 TCP/IP スタック **F-Stack** で動く、Tokio 
 .
 ├── Cargo.toml                     # ワークスペース
 ├── README.md
+├── SKILL.md                      # 運用/拡張スキル（英語）
+├── prompts/
+│   └── minecraft-version-upgrade.md  # 新バージョン追従プロンプト
 ├── docs/
 │   ├── architecture.md            # リアクターとスレッドモデルの詳細
+│   ├── benchmark.md               # カーネル vs F-Stack の性能比較
 │   ├── fstack.md                  # F-Stack/DPDK デプロイ手順
 │   ├── protocol.md                # プロトコルとフォワーディング仕様
 │   └── workers.md                 # ワーカーモデル / native-mt / RingBuffer
+├── scripts/
+│   ├── build-fstack.sh            # F-Stack/DPDK ビルド
+│   └── run-fstack-net-tap.sh      # net_tap での実機検証
 ├── crates/
 │   ├── tokio-fstack/              # Tokio 互換ソケットライブラリ
 │   │   ├── src/{lib,sys,ops,reactor,worker,poll_io,stream,listener,udp}.rs
@@ -78,6 +85,8 @@ DPDK 上のユーザー空間 TCP/IP スタック **F-Stack** で動く、Tokio 
 │   │   ├── examples/echo_{server,client}.rs
 │   │   └── tests/socket.rs        # リアクター/ソケットの統合テスト
 │   └── mc-proxy/                  # Velocity 互換プロキシ
+│       ├── build.rs               # F-Stack 用 --no-gc-sections
+│       ├── examples/bench.rs      # ベンチマーク（status/login/relay + fake backend）
 │       ├── config.example.toml
 │       ├── src/
 │       │   ├── protocol/          # VarInt, フレーミング, 圧縮, 暗号, パケット
@@ -212,59 +221,86 @@ client                mc-proxy                         Paper backend
 F-Stack は DPDK が NIC を専有した状態で、その上に FreeBSD 由来の TCP/IP
 スタックを提供します。Rust 側は `ff_*` API を直接呼び出します。
 
-### 1. F-Stack と DPDK のビルド
+**検証済み**: Ubuntu 24.04 + DPDK 24.11.8 + F-Stack v2.0 (master) で
+ビルド・リンクし、`net_tap` PMD 経由で実際の Minecraft status ping に
+応答するところまで確認しています。詳細・トラブルシューティングは
+[docs/fstack.md](docs/fstack.md) を参照してください。
+
+### 1. 依存パッケージ
 
 ```bash
-git clone https://github.com/F-Stack/f-stack.git
-cd f-stack
-make            # DPDK と FreeBSD スタックをビルド
-sudo make install
+sudo apt-get install -y git gcc g++ make pkg-config python3 python3-pyelftools \
+  meson ninja-build bc libssl-dev libnuma-dev libnuma1 libpcre3 libpcre3-dev \
+  zlib1g-dev libpcap-dev libelf-dev libarchive-dev libbsd-dev \
+  libsystemd-dev libmd-dev nettle-dev libxml2-dev libacl1-dev liblzma-dev \
+  liblz4-dev libbz2-dev libzstd-dev libdbus-1-dev libibverbs-dev \
+  libnl-3-dev libnl-route-3-dev ibverbs-providers
 ```
 
-### 2. hugepages と NIC のバインド
+後半は DPDK の静的リンク（`-lsystemd`、`-lmd`、`-larchive` など）に必要です。
+
+### 2. DPDK + F-Stack のビルド
 
 ```bash
-echo 1024 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
-sudo mkdir -p /mnt/huge
-sudo mount -t hugetlbfs nodev /mnt/huge
-# NIC を DPDK 用ドライバにバインド（vfio-pci など）
-sudo modprobe vfio-pci
-# 例: 0000:00:06.0 を vfio-pci に
-sudo dpdk-devbind.py --bind=vfio-pci 0000:00:06.0
-```
+git clone --depth 1 https://github.com/F-Stack/f-stack.git /tmp/f-stack
+cd /tmp/f-stack/dpdk
+meson setup -Denable_kmods=false -Dprefix=/usr/local build
+ninja -C build && sudo ninja -C build install
+sudo ldconfig
 
-`/etc/f-stack.conf` にアドレスやゲートウェイを設定します
-（詳細は [F-Stack の設定ドキュメント](https://f-stack.org/) を参照）。
+export PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig:\
+/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig
+cd /tmp/f-stack/lib && make -j"$(nproc)" && sudo make install PREFIX=/usr/local
+sudo ldconfig
+```
 
 ### 3. プロキシを F-Stack バックエンドでビルド
 
 ```bash
 FSTACK_LIB_DIR=/usr/local/lib \
-PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
+PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig \
 cargo build --release -p mc-proxy --features fstack
 ```
 
-`build.rs` が `pkg-config --static --libs libdpdk` の結果と
-`libfstack.a`（`--whole-archive`）をリンクします。
-F-Stack を共有ライブラリとしてリンクする場合は `FSTACK_LIBS="fstack dpdk"`
-のように明示できます。
+`build.rs` が `pkg-config --static --libs libdpdk`、`libfstack.a`
+（`--whole-archive`）、bonding/timer の追加ライブラリ、そして
+`--no-gc-sections` をリンクします。F-Stack の SYSINIT/VNET は ELF
+リンカーセットに入っており、`--gc-sections` で破棄されると
+`ff_freebsd_init` が落ちるため、このフラグは必須です。
 
-F-Stack のバージョンは `ff_epoll_create` / `ff_epoll_ctl` / `ff_epoll_wait`
-（`lib/ff_epoll.h`）を提供するものが必要です。
-
-### 4. EAL 引数と起動
+### 4. 起動
 
 ```toml
 [fstack]
-eal_args = ["--conf", "/etc/f-stack.conf", "--proc-type=primary", "--file-prefix=mc-proxy"]
+# f-stack の CLI が受け付けるのは --conf / --proc-type / --proc-id のみ。
+# --vdev や --file-prefix は /etc/f-stack.conf の extra_eal_args に書く。
+eal_args = ["--conf", "/etc/f-stack.conf", "--proc-type=primary"]
 ```
 
 ```bash
 sudo ./target/release/mc-proxy --config config.toml
 ```
 
-F-Stack は hugepage と NIC へのアクセスが必要なため、root または
-`CAP_SYS_RAWIO` / `CAP_IPC_LOCK` などの権限で起動してください。
+`ff_init`/`ff_run` は**メインスレッド**で実行する必要があります。
+プロキシは `tokio_fstack::run_with_stack` を使い、メインスレッドで
+`ff_init` → `ff_run`、別スレッドで Tokio ランタイムを動かします。
+ソケット操作はキュー経由でメインスレッドに渡されます。
+
+F-Stack バックエンドは 1 プロセス 1 スタックです（`workers = 1`）。
+マルチコアは 1 プロセス 1 コアで複数起動し、`SO_REUSEPORT` で
+待ち受けてください。
+
+### 5. net_tap での動作確認
+
+物理 NIC がなくても検証できます。
+
+```bash
+sudo ./scripts/run-fstack-net-tap.sh
+# => F-STACK STATUS OK: §aF-Stack net_tap test | max 42
+```
+
+`net_tap` は tap と F-Stack に同じ MAC を設定するため、ARP が通らない
+場合があります。スクリプトはカーネル側 tap の MAC を変更して回避します。
 
 **注意点**
 
@@ -274,10 +310,8 @@ F-Stack は hugepage と NIC へのアクセスが必要なため、root また�
   ルートが必要です（もしくは管理用 NIC を分ける、`online_mode = false` にする）。
 - バックエンドのアドレスは IP リテラルを推奨します。名前解決はホストカーネルの
   DNS を使うため、DPDK 専有環境では解決できない場合があります。
-
-F-Stack 固有のスレッドモデル（`ff_*` を呼べるのは `ff_run` を実行している
-1 スレッドだけ）への対応は [docs/architecture.md](docs/architecture.md) を
-参照してください。
+- 専用スレッドから `ff_init` を呼ぶと `ff_freebsd_init` で落ちます。
+  `run_with_stack` を使ってください。
 
 ## `tokio-fstack` ライブラリ
 
@@ -342,9 +376,48 @@ cargo run --example echo_client
   Drop がスタック側の syscall 完了を待つため、キャンセル時も use-after-free は
   発生しません（[docs/architecture.md](docs/architecture.md)）。
 - ソケットの fd は `Drop` でリアクターから登録解除され、F-Stack 側では
-  `ff_close` がスタックスレッド上で実行されます。
+  `ff_close` が F-Stack スレッド（メインスレッド）上で実行されます。
+
+## パフォーマンス（カーネル vs F-Stack）
+
+同一ホストで、カーネルソケット版と F-Stack 版（net_tap）を 1 コア固定で
+比較した結果です（8 vCPU VM、8 クライアント、5 秒、エラー 0）。
+
+| ワークロード | カーネル | F-Stack | 比 |
+|---|---:|---:|---:|
+| status（新規接続） | 3,150 conn/s | 2,918 conn/s | 0.93x |
+| login | 1,055 /s | 728 /s | 0.69x |
+| relay 64B | 18,077 msg/s | 5,800 msg/s | 0.32x |
+| relay 1KB | 6,848 msg/s | 3,736 msg/s | 0.55x |
+
+- **status はほぼ互角**。接続あたりのプロキシ CPU が支配的です。
+- **relay は F-Stack が 0.3〜0.5 倍**。net_tap では 1 メッセージあたり
+  4 回の tap 横断があり、さらに全 syscall が単一スタックスレッドに
+  直列化されるためです。2 コアを与えてもスタック側がボトルネックで
+  スケールしませんでした。
+- これは **net_tap + 現行の 1 スタック構成**での結果です。物理 NIC + DPDK
+  （RSS / zero-copy / カーネルバイパス）や native-mt では特性が変わります。
+- `idle_sleep` は 50 µs 前後がバランス点。1 ms にすると CPU は下がりますが
+  relay のレイテンシが約 7 ms まで悪化します。
+
+**チューニング効果**（2 コア、スタック用 + アプリ用）:
+`pkt_tx_delay=0`、`idle_loop_interval=0`、`net.inet.tcp.delayed_ack=0`、
+送受信バッファ 64KB にすると **login が 517 → 938 /s（約 1.8 倍）**。
+relay / status はスタックスレッドが 1 コアで飽和するため横ばいです。
+
+**マルチコア**は「1 プロセス 1 スタック」でスケールします。2 プロセス
+（別タップ・別 IP・lcore 0/1）で status を並列に流すと
+**2,936 + 2,989 = 5,925 conn/s**（単一プロセスの約 2 倍、エラー 0）。
+現状はプロセス間でプレイヤー状態を共有しないため、共有するには
+`rte_ring` / `ff_ipc` による制御メッセージか native-mt が必要です。
+
+詳細・2 コアの結果・再現コマンドは
+[docs/benchmark.md](docs/benchmark.md) を参照してください。
 
 ## ワーカーモデル（マルチコア）
+
+以下は per-core worker の構成図です（F-Stack では native-mt の将来像。
+現行の F-Stack バックエンドは 1 プロセス 1 スタックです）。
 
 ```
 CPU Core 0                                  CPU Core 1
@@ -498,6 +571,15 @@ Configuration ステートのリレーが実サーバーで動作することが
   1 プロセス 1 worker で複数プロセス起動してください（native-mt 対応は
   [docs/workers.md](docs/workers.md) の今後の課題）。
 - F-Stack バックエンドでは DNS 解決にホストカーネルのリゾルバを使います。
+
+## メンテナンス
+
+- プロジェクトの全体像・不変条件・拡張レシピは [SKILL.md](SKILL.md)（英語）に
+  まとめています。
+- Minecraft の新バージョンに追従するときは
+  [prompts/minecraft-version-upgrade.md](prompts/minecraft-version-upgrade.md)
+  のプロンプトを使用してください。差分の分類、変更対象ファイル、
+  実 Paper での検証手順、完了条件を含みます。
 
 ## 参考資料
 

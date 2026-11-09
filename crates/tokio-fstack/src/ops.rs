@@ -25,7 +25,7 @@ use std::task::{Context, Poll, Waker};
 
 use crate::sys;
 
-/// A mutable buffer pointer that is safe to move to the stack thread.
+/// A mutable buffer pointer that is safe to move to the F-Stack thread.
 #[derive(Clone, Copy)]
 pub(crate) struct BufPtr(pub(crate) *mut u8);
 
@@ -34,7 +34,7 @@ pub(crate) struct BufPtr(pub(crate) *mut u8);
 // outlives that execution.
 unsafe impl Send for BufPtr {}
 
-/// A shared buffer pointer that is safe to move to the stack thread.
+/// A shared buffer pointer that is safe to move to the F-Stack thread.
 #[derive(Clone, Copy)]
 pub(crate) struct ConstBufPtr(pub(crate) *const u8);
 
@@ -138,7 +138,7 @@ fn op_name(op: &Op) -> &'static str {
 
 impl Op {
     /// Execute the syscall. Must only be called on the thread that owns the
-    /// socket (the stack thread for F-Stack).
+    /// socket (the F-Stack thread for F-Stack).
     pub(crate) fn execute(self) -> io::Result<OpResult> {
         match self {
             Op::Socket { domain, ty, proto } => sys::socket(domain, ty, proto).map(OpResult::Fd),

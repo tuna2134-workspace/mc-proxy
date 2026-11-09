@@ -2,8 +2,8 @@
 //!
 //! A [`Worker`](spawn_worker) owns
 //!
-//! * an independent reactor (its own epoll instance on the standard backend,
-//!   or its own F-Stack stack thread on the `fstack` backend),
+//! * an independent reactor (its own epoll instance on the standard backend;
+//!   the `fstack` backend is single-stack and does not support `workers > 1`),
 //! * a Tokio `current_thread` runtime running on a dedicated thread pinned to
 //!   a CPU core, and
 //! * an inbox of a [`WorkerBus`] ring buffer for messages from other workers.
@@ -11,12 +11,11 @@
 //! # F-Stack mapping
 //!
 //! F-Stack's native multi-thread mode (`thread_mode=1`) gives every lcore
-//! thread its own stack instance (VNET isolation) and its own RX/TX queue.
-//! Start the process with `lcore_mask` set to N cores; the library then runs
-//! one worker per lcore. `ff_init`/`ff_run` remain single calls per process,
-//! which is why the `fstack` feature refuses to start a second stack instance:
-//! use one process with `thread_mode=1` and N workers, not N processes (or,
-//! with older F-Stack versions, N processes each with one worker).
+//! thread its own stack instance (VNET isolation) and its own RX/TX queue, but
+//! the current integration still creates one stack per process: `workers > 1`
+//! is therefore rejected on the `fstack` backend. Scale F-Stack with one
+//! process per core and `SO_REUSEPORT` (see `docs/workers.md`); a per-lcore
+//! dispatch for `thread_mode=1` is a future step.
 //!
 //! Sockets are *worker affine*: they are created on, and their I/O operations
 //! run on, the platform of the worker thread that created them. Do not move a

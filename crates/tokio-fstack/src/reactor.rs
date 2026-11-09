@@ -3,7 +3,7 @@
 //! # Architecture
 //!
 //! ```text
-//!   tokio task threads                       reactor / stack thread
+//!   tokio task threads                       reactor / F-Stack thread
 //!   ------------------                       ----------------------
 //!   poll_read() ──submit Op──────────────────▶ execute syscall (non-blocking)
 //!        ▲                                         │
@@ -17,9 +17,10 @@
 //!
 //! The standard backend executes syscalls inline on the calling thread and
 //! keeps only readiness on the driver thread. The F-Stack backend executes
-//! *everything* (syscalls and epoll updates) on one dedicated thread, because
-//! F-Stack is a single-threaded user-space network stack whose API is only
-//! valid on the thread that called `ff_init`/`ff_run`.
+//! *everything* (syscalls and epoll updates) on the thread that called
+//! `ff_init`/`ff_run` -- the process main thread -- because F-Stack is a
+//! single-threaded user-space network stack. Application tasks run on a
+//! separate thread and submit operations to that thread.
 //!
 //! Readiness is level-triggered: once an event is delivered for a direction
 //! its interest is cleared, so a socket that nobody is waiting on does not wake
@@ -82,7 +83,7 @@ enum Kind {
     /// Standard backend: syscalls run inline, readiness on the driver thread.
     #[cfg_attr(feature = "fstack", allow(dead_code))]
     Std { epfd: i32 },
-    /// F-Stack backend: everything runs on the stack thread.
+    /// F-Stack backend: everything runs on the F-Stack thread.
     Fstack { queue: Mutex<VecDeque<Command>> },
 }
 
@@ -354,6 +355,8 @@ pub(crate) struct Reactor {
 }
 
 static REACTOR: std::sync::OnceLock<Arc<Reactor>> = std::sync::OnceLock::new();
+#[cfg(feature = "fstack")]
+static FSTACK_EPFD: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
 static INIT_LOCK: Mutex<()> = Mutex::new(());
 
 thread_local! {
@@ -447,44 +450,86 @@ fn build(_config: Config) -> io::Result<Arc<Reactor>> {
 }
 
 #[cfg(feature = "fstack")]
-fn build(config: Config) -> io::Result<Arc<Reactor>> {
-    static FSTACK_STARTED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-    if FSTACK_STARTED
-        .compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Relaxed,
-        )
-        .is_err()
-    {
-        return Err(io::Error::other(
-            "F-Stack supports one stack instance per process; start one worker per process",
-        ));
+fn build(_config: Config) -> io::Result<Arc<Reactor>> {
+    Err(io::Error::other(
+        "F-Stack must be initialised on the main thread: use \
+         tokio_fstack::run_with_stack (or init_fstack + run_fstack_loop)",
+    ))
+}
+
+/// Initialise F-Stack and create the reactor on the **calling thread**.
+///
+/// F-Stack's `ff_init` must run on the process main thread (it installs
+/// per-thread FreeBSD state that later initialisation steps rely on). The
+/// caller must subsequently call [`run_fstack_loop`] on the same thread;
+/// the proxy/application runs on another thread and submits operations
+/// through the reactor queue.
+#[cfg(feature = "fstack")]
+pub(crate) fn init_fstack(config: Config) -> io::Result<()> {
+    let _guard = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if REACTOR.get().is_some() {
+        return Ok(());
     }
+
+    // argv[0] is the program name, the rest are EAL/F-Stack arguments.
+    let mut args = Vec::with_capacity(config.eal_args.len() + 1);
+    args.push(
+        std::env::args()
+            .next()
+            .unwrap_or_else(|| "mc-proxy".to_owned()),
+    );
+    args.extend(config.eal_args);
+    let c_args = sys::cstrings(&args)?;
+    let mut argv: Vec<*const libc::c_char> = c_args.iter().map(|c| c.as_ptr()).collect();
+    argv.push(std::ptr::null());
+
+    sys::init(argv.len() as i32 - 1, argv.as_ptr())?;
+    let epfd = sys::epoll_create()?;
     let reactor = Arc::new(Reactor {
         platform: Arc::new(Platform::fstack()),
         sockets: Mutex::new(HashMap::new()),
     });
-    let worker = Arc::clone(&reactor);
-    let eal_args = config.eal_args;
-    let (tx, rx) = sync_channel(1);
-    std::thread::Builder::new()
-        .name("tokio-fstack-stack".to_owned())
-        .stack_size(2 * 1024 * 1024)
-        .spawn(move || {
-            if let Err(err) = fstack_thread(worker, eal_args, tx) {
-                eprintln!("tokio-fstack: F-Stack thread stopped: {err}");
-            }
-        })?;
-    match rx.recv() {
-        Ok(Ok(())) => Ok(reactor),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Err(io::Error::other(
-            "F-Stack thread exited during initialisation",
-        )),
+    if FSTACK_EPFD.set(epfd).is_err() {
+        return Err(io::Error::other("F-Stack epoll fd already initialised"));
     }
+    let _ = REACTOR.set(reactor);
+    Ok(())
+}
+
+/// Run the F-Stack event loop on the calling thread until `ff_stop_run`.
+///
+/// Must be called on the same thread as [`init_fstack`].
+#[cfg(feature = "fstack")]
+pub(crate) fn run_fstack_loop() -> io::Result<()> {
+    let reactor = match REACTOR.get() {
+        Some(reactor) => Arc::clone(reactor),
+        None => {
+            return Err(io::Error::other(
+                "run_fstack_loop called before init_fstack",
+            ))
+        }
+    };
+    let epfd = match FSTACK_EPFD.get() {
+        Some(epfd) => *epfd,
+        None => return Err(io::Error::other("F-Stack epoll fd is missing")),
+    };
+    let ctx = Box::new(StackContext {
+        reactor,
+        epfd,
+        events: (0..512).map(|_| sys::make_event(0, 0)).collect(),
+        batch: Vec::with_capacity(256),
+    });
+    let ctx = Box::into_raw(ctx);
+    // SAFETY: `ctx` is leaked and outlives the (blocking) event loop; the
+    // callback only dereferences it from this same thread.
+    unsafe { sys::run(fstack_tick, ctx as *mut libc::c_void) };
+    Ok(())
+}
+
+/// Stop the F-Stack event loop (thread-safe).
+#[cfg(feature = "fstack")]
+pub(crate) fn stop_fstack_loop() {
+    sys::stop_run();
 }
 
 /// Turn an epoll event mask into reactor readiness bits.
@@ -539,9 +584,6 @@ fn std_driver(reactor: Arc<Reactor>) {
 }
 
 #[cfg(feature = "fstack")]
-use std::sync::mpsc::sync_channel;
-
-#[cfg(feature = "fstack")]
 struct StackContext {
     reactor: Arc<Reactor>,
     epfd: i32,
@@ -550,53 +592,9 @@ struct StackContext {
 }
 
 #[cfg(feature = "fstack")]
-fn fstack_thread(
-    reactor: Arc<Reactor>,
-    eal_args: Vec<String>,
-    ready: std::sync::mpsc::SyncSender<io::Result<()>>,
-) -> io::Result<()> {
-    // argv[0] is the program name, the rest are EAL/F-Stack arguments.
-    let mut args = Vec::with_capacity(eal_args.len() + 1);
-    args.push(
-        std::env::args()
-            .next()
-            .unwrap_or_else(|| "mc-proxy".to_owned()),
-    );
-    args.extend(eal_args);
-    let c_args = sys::cstrings(&args)?;
-    let mut argv: Vec<*const libc::c_char> = c_args.iter().map(|c| c.as_ptr()).collect();
-    argv.push(std::ptr::null());
-
-    if let Err(err) = sys::init(argv.len() as i32 - 1, argv.as_ptr()) {
-        let _ = ready.send(Err(err));
-        return Ok(());
-    }
-    let epfd = match sys::epoll_create() {
-        Ok(fd) => fd,
-        Err(err) => {
-            let _ = ready.send(Err(err));
-            return Ok(());
-        }
-    };
-    let _ = ready.send(Ok(()));
-
-    let ctx = Box::new(StackContext {
-        reactor,
-        epfd,
-        events: (0..512).map(|_| sys::make_event(0, 0)).collect(),
-        batch: Vec::with_capacity(256),
-    });
-    let ctx = Box::into_raw(ctx);
-    // SAFETY: `ctx` is leaked and outlives the (never returning) event loop;
-    // `fstack_tick` only dereferences it from this same thread.
-    unsafe { sys::run(fstack_tick, ctx as *mut libc::c_void) };
-    Ok(())
-}
-
-#[cfg(feature = "fstack")]
 unsafe extern "C" fn fstack_tick(arg: *mut libc::c_void) -> i32 {
-    // SAFETY: `arg` is the leaked `StackContext` created in `fstack_thread`,
-    // and the F-Stack loop runs this callback on that same thread.
+    // SAFETY: `arg` is the leaked `StackContext` created in `run_fstack_loop`,
+    // and the F-Stack loop runs this callback on the same thread.
     let ctx = unsafe { &mut *(arg as *mut StackContext) };
 
     // 1. Run queued syscalls and interest changes.

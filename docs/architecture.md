@@ -41,17 +41,23 @@ F-Stack の API は「`ff_init` と `ff_run` を呼んだスレッド」でし�
 Tokio のワーカースレッドから `ff_*` を呼ぶと、スタックの状態が壊れるか
 フェイルファストします。
 
-そこで F-Stack backend では、**1 本のスタックスレッド**が
+さらに `ff_init`/`ff_run` は**プロセスのメインスレッド**で実行する必要が
+あります（`ff_freebsd_init` が per-thread の FreeBSD 状態を初期化し、
+リンカーセットの SYSINIT を実行するため）。
+
+そこで F-Stack backend では、**メインスレッド**が
 
 1. `ff_init(argv)` を実行し、
 2. `ff_run(tick, ctx)` に入り、
 3. `tick` の中で「キューに溜まった全 syscall」と「全 epoll 操作」を実行し、
 4. `ff_epoll_wait(epfd, events, 512, 0)` で readiness を取得して `Waker` を起こす
 
-という構造にしています。Tokio 側は `Op` をキューに積んで完了を待つだけです。
+という構造にしています。アプリケーション（Tokio ランタイムとプロキシ）は
+別スレッドで動き、`Op` をキューに積んで完了を待つだけです。
+`tokio_fstack::run_with_stack` がこのセットアップをカプセル化しています。
 
 ```
-tokio task ── push(Op) ──▶ queue ──▶ ff_run tick ──▶ ff_recv/ff_send/...
+app thread ── push(Op) ──▶ queue ──▶ ff_run tick (main) ──▶ ff_recv/ff_send/...
      ▲                                      │
      └──────────── Waker ◀──────────────────┘
 ```

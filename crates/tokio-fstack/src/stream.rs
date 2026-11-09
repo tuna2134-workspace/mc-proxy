@@ -198,7 +198,7 @@ impl TcpStream {
 
     /// Enable or disable Nagle's algorithm.
     ///
-    /// On the F-Stack backend the option is applied on the stack thread, so
+    /// On the F-Stack backend the option is applied on the F-Stack thread, so
     /// the call blocks until it has been executed.
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         ops::submit_blocking(Op::SetSockOpt {
@@ -395,7 +395,7 @@ impl AsyncWrite for TcpStream {
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Packets are handed to the stack thread immediately; there is no
+        // Packets are handed to the F-Stack thread immediately; there is no
         // user-space write buffer to flush beyond the in-flight op.
         Poll::Ready(Ok(()))
     }

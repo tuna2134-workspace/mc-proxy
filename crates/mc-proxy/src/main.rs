@@ -81,56 +81,54 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_name("mc-proxy-worker")
-        .build()
-    {
-        Ok(runtime) => runtime,
+    // F-Stack requires ff_init/ff_run on the main thread. run_with_stack
+    // takes care of both backends: on the standard backend it just calls the
+    // closure; on F-Stack it initialises on this thread, runs the application
+    // on another thread, and enters ff_run here.
+    let stack_config =
+        tokio_fstack::Config::default().with_eal_args(config.fstack.eal_args.iter().cloned());
+    let app_config = config;
+    let result = tokio_fstack::run_with_stack(stack_config, move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("mc-proxy-worker")
+            .build()?;
+        runtime.block_on(async move {
+            let proxy = Proxy::bind(app_config)
+                .await
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            let shared = proxy.shared().clone();
+            info!(
+                backend = tokio_fstack::backend(),
+                listen = %proxy.local_addr(),
+                online_mode = shared.config.online_mode,
+                workers = shared.config.workers,
+                forwarding = shared.forwarding_enabled(),
+                compression = ?shared.config.compression(),
+                servers = shared
+                    .servers
+                    .iter()
+                    .map(|server| format!("{}={}", server.name, server.address))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                "mc-proxy started"
+            );
+
+            let result = tokio::select! {
+                result = proxy.run() => result,
+                _ = tokio::signal::ctrl_c() => {
+                    info!("shutdown signal received");
+                    Ok(())
+                }
+            };
+            result
+        })
+    });
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            error!("failed to start the Tokio runtime: {err}");
-            return ExitCode::FAILURE;
+            error!("proxy stopped: {err}");
+            ExitCode::FAILURE
         }
-    };
-
-    runtime.block_on(async move {
-        let proxy = match Proxy::bind(config).await {
-            Ok(proxy) => proxy,
-            Err(err) => {
-                error!("failed to start the proxy: {err}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let shared = proxy.shared().clone();
-        info!(
-            backend = tokio_fstack::backend(),
-            listen = %proxy.local_addr(),
-            online_mode = shared.config.online_mode,
-            workers = shared.config.workers,
-            forwarding = shared.forwarding_enabled(),
-            compression = ?shared.config.compression(),
-            servers = shared
-                .servers
-                .iter()
-                .map(|server| format!("{}={}", server.name, server.address))
-                .collect::<Vec<_>>()
-                .join(","),
-            "mc-proxy started"
-        );
-
-        let result = tokio::select! {
-            result = proxy.run() => result,
-            _ = tokio::signal::ctrl_c() => {
-                info!("shutdown signal received");
-                Ok(())
-            }
-        };
-        match result {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                error!("proxy stopped: {err}");
-                ExitCode::FAILURE
-            }
-        }
-    })
+    }
 }
