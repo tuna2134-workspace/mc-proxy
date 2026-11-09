@@ -90,6 +90,9 @@ Paper 側は `VelocityProxy.checkIntegrity` で先頭 32 バイトの HMAC を�
    - server id: `""`
    - public key: X.509 SubjectPublicKeyInfo DER
    - verify token: 4 バイトの乱数
+   - **1.20.5+ (protocol 766) のみ**: Should Authenticate = `true`
+     （1.19.3〜1.20.4 には存在しません。付けるとクライアントの
+     `clientbound/minecraft:hello` デコードが失敗します）
 3. Encryption Response を受信し、RSA/PKCS#1 v1.5 で共有シークレットと
    verify token を復号。共有シークレットは 16 バイトでなければならない。
 4. AES-128-CFB8 を両方向で有効化（鍵 = IV = 共有シークレット）。
@@ -131,8 +134,12 @@ String hash = new BigInteger(digest).toString(16);
 | 1.19 | 759 | Login Start にプロファイル鍵データ（無視） |
 | 1.19.3 | 761 | プロファイル鍵データ廃止 |
 | 1.20.2 | 764 | Login Start に UUID、Login Acknowledged、Configuration ステート |
-| 1.20.5 | 766 | Cookie Request/Response（ログイン中は未対応） |
+| 1.20.5 | 766 | Encryption Request に Should Authenticate (bool) 追加。Cookie Request/Response（ログイン中は未対応） |
 | 1.21.x | 767–770+ | Play パケットは不透明リレー |
+
+> `Should Authenticate` は 1.19.3 (761) ではなく **1.20.5 (766)** で
+> 追加されました。1.19.3 は Login Start のプロファイル鍵データ廃止のみで、
+> Encryption Request の形式は変わっていません。
 
 プレイ/Configuration のパケット ID はバージョンごとに異なりますが、
 クライアントとバックエンドが同じバージョンであるため、プロキシは ID を

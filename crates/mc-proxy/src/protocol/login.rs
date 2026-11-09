@@ -396,7 +396,7 @@ mod tests {
     fn encryption_request_gates_should_authenticate_on_1_20_5() {
         // 1.19.3 (761), 1.20.2 (764) and 1.20.4 (765) must NOT carry the
         // boolean; only 1.20.5 (766)+ does.
-        for protocol in [393, 761, 764, 765] {
+        for protocol in [393, 760, 761, 764, 765] {
             let payload = encode_encryption_request("", &[1, 2, 3], &[4, 5, 6, 7], protocol, true);
             let mut reader = Reader::new(&payload);
             assert_eq!(reader.read_string(20).unwrap(), "");
