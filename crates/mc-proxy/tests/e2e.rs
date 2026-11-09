@@ -513,6 +513,13 @@ servers = ["lobby"]
     assert_eq!(server_id, "");
     let public_key = request_reader.read_byte_array(2048).unwrap().to_vec();
     let verify_token = request_reader.read_byte_array(64).unwrap().to_vec();
+    // Protocol 770 (1.20.5+) carries the Should Authenticate boolean; without
+    // it the client fails with "Failed to decode clientbound/minecraft:hello".
+    assert!(
+        request_reader.read_bool().unwrap(),
+        "Should Authenticate must be true"
+    );
+    assert_eq!(request_reader.remaining(), 0);
 
     let mut shared_secret = [0u8; 16];
     rand::RngCore::fill_bytes(&mut OsRng, &mut shared_secret);

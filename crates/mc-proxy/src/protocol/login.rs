@@ -219,16 +219,33 @@ pub fn encode_login_start(name: &str, uuid: Option<&Uuid>, protocol: i32) -> Vec
     writer.into_inner()
 }
 
+/// Protocol version that added the `Should Authenticate` boolean to the
+/// Encryption Request (Minecraft 1.20.5, protocol 766).
+///
+/// Note: 1.19.3 (761) did **not** add this field; it only changed Login Start
+/// profile-key handling. Sending the boolean to 1.19.3–1.20.4 clients
+/// corrupts their decode, and omitting it for 1.20.5+ clients corrupts theirs.
+pub const SHOULD_AUTHENTICATE_PROTOCOL: i32 = 766;
+
 /// Encode an Encryption Request.
+///
+/// `Should Authenticate` is only present for protocol >= 1.20.5 (766). The
+/// proxy always sends `true` because it verifies the player with the Mojang
+/// session server.
 pub fn encode_encryption_request(
     server_id: &str,
     public_key: &[u8],
     verify_token: &[u8],
+    protocol_version: i32,
+    should_authenticate: bool,
 ) -> Vec<u8> {
     let mut writer = Writer::new();
     writer.string(server_id);
     writer.byte_array(public_key);
     writer.byte_array(verify_token);
+    if protocol_version >= SHOULD_AUTHENTICATE_PROTOCOL {
+        writer.bool(should_authenticate);
+    }
     writer.into_inner()
 }
 
@@ -373,5 +390,46 @@ mod tests {
         assert_eq!(reader.read_string(1024).unwrap(), "abc");
         assert!(reader.read_bool().unwrap());
         assert_eq!(reader.read_string(1024).unwrap(), "sig");
+    }
+
+    #[test]
+    fn encryption_request_gates_should_authenticate_on_1_20_5() {
+        // 1.19.3 (761), 1.20.2 (764) and 1.20.4 (765) must NOT carry the
+        // boolean; only 1.20.5 (766)+ does.
+        for protocol in [393, 761, 764, 765] {
+            let payload = encode_encryption_request("", &[1, 2, 3], &[4, 5, 6, 7], protocol, true);
+            let mut reader = Reader::new(&payload);
+            assert_eq!(reader.read_string(20).unwrap(), "");
+            assert_eq!(reader.read_byte_array(512).unwrap(), &[1, 2, 3]);
+            assert_eq!(reader.read_byte_array(512).unwrap(), &[4, 5, 6, 7]);
+            assert_eq!(
+                reader.remaining(),
+                0,
+                "Should Authenticate must be absent before 1.20.5 (protocol {protocol})"
+            );
+        }
+        for protocol in [766, 767, 770, 771] {
+            let payload = encode_encryption_request("", &[1, 2, 3], &[4, 5, 6, 7], protocol, true);
+            let mut reader = Reader::new(&payload);
+            assert_eq!(reader.read_string(20).unwrap(), "");
+            assert_eq!(reader.read_byte_array(512).unwrap(), &[1, 2, 3]);
+            assert_eq!(reader.read_byte_array(512).unwrap(), &[4, 5, 6, 7]);
+            assert!(
+                reader.read_bool().unwrap(),
+                "Should Authenticate must be true for protocol {protocol}"
+            );
+            assert_eq!(reader.remaining(), 0);
+        }
+    }
+
+    #[test]
+    fn encryption_request_can_disable_authentication() {
+        let payload = encode_encryption_request("", &[9], &[8], 770, false);
+        let mut reader = Reader::new(&payload);
+        assert_eq!(reader.read_string(20).unwrap(), "");
+        assert_eq!(reader.read_byte_array(512).unwrap(), &[9]);
+        assert_eq!(reader.read_byte_array(512).unwrap(), &[8]);
+        assert!(!reader.read_bool().unwrap());
+        assert_eq!(reader.remaining(), 0);
     }
 }

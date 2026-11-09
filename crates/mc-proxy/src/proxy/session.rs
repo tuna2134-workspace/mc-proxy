@@ -293,7 +293,15 @@ async fn handle_login(
     }
     debug!(player = %login_start.name, %peer, "login start");
 
-    let profile = authenticate(&mut reader, &mut writer, &shared, &login_start, peer).await?;
+    let profile = authenticate(
+        &mut reader,
+        &mut writer,
+        &shared,
+        &login_start,
+        peer,
+        handshake.protocol_version,
+    )
+    .await?;
 
     let mut last_error = String::new();
     for server in shared.servers.candidates(&handshake.server_address) {
@@ -330,6 +338,7 @@ async fn authenticate(
     shared: &Shared,
     login_start: &LoginStart,
     peer: SocketAddr,
+    protocol_version: i32,
 ) -> Result<GameProfile, SessionError> {
     if !shared.config.online_mode {
         // The UUID is derived from the name, exactly like the vanilla
@@ -344,7 +353,15 @@ async fn authenticate(
 
     let key = shared.key.as_ref().ok_or(SessionError::AuthFailed)?;
     let verify_token = random_verify_token()?;
-    let request = login::encode_encryption_request("", key.public_key_der(), &verify_token);
+    // 1.20.5+ (protocol 766) requires the trailing Should Authenticate
+    // boolean; older clients must not receive it.
+    let request = login::encode_encryption_request(
+        "",
+        key.public_key_der(),
+        &verify_token,
+        protocol_version,
+        true,
+    );
     writer
         .write_packet(clientbound::ENCRYPTION_REQUEST, &request)
         .await?;
