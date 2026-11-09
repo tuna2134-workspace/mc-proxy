@@ -1,0 +1,618 @@
+//! The readiness reactor and its two platform drivers.
+//!
+//! # Architecture
+//!
+//! ```text
+//!   tokio task threads                       reactor / stack thread
+//!   ------------------                       ----------------------
+//!   poll_read() ──submit Op──────────────────▶ execute syscall (non-blocking)
+//!        ▲                                         │
+//!        └──────── wake (Waker) ◀───────────────────┘
+//!   poll_read() gets EAGAIN
+//!        │
+//!        ├── arm(READ) ──submit Interest──────────▶ epoll_ctl(MOD, EPOLLIN)
+//!        │                                         │
+//!        └──────── wake on readiness ◀────── epoll_wait / ff_epoll_wait
+//! ```
+//!
+//! The standard backend executes syscalls inline on the calling thread and
+//! keeps only readiness on the driver thread. The F-Stack backend executes
+//! *everything* (syscalls and epoll updates) on one dedicated thread, because
+//! F-Stack is a single-threaded user-space network stack whose API is only
+//! valid on the thread that called `ff_init`/`ff_run`.
+//!
+//! Readiness is level-triggered: once an event is delivered for a direction
+//! its interest is cleared, so a socket that nobody is waiting on does not wake
+//! the reactor in a loop; it is re-armed the next time a task waits.
+
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+use std::io;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::task::{Context, Poll, Waker};
+
+use crate::ops::{Op, Slot};
+use crate::sys;
+use crate::sys::{READ, WRITE};
+use crate::Config;
+
+/// A command executed by the thread that owns the I/O platform.
+pub(crate) enum Command {
+    Op(Op, Arc<Slot>),
+    Register(i32),
+    Deregister(i32),
+    Interest(i32, u8),
+    Shutdown(i32, i32),
+    Close(i32),
+}
+
+/// Execute a command against the given epoll instance.
+fn apply(epfd: i32, command: Command) {
+    match command {
+        Command::Op(op, slot) => slot.run(op),
+        Command::Register(fd) => {
+            let mut ev = sys::make_event(0, fd as u64);
+            let _ = sys::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut ev);
+        }
+        Command::Deregister(fd) => {
+            let mut ev = sys::make_event(0, fd as u64);
+            let _ = sys::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, fd, &mut ev);
+        }
+        Command::Interest(fd, bits) => {
+            let mut mask = 0u32;
+            if bits & READ != 0 {
+                mask |= libc::EPOLLIN as u32;
+            }
+            if bits & WRITE != 0 {
+                mask |= libc::EPOLLOUT as u32;
+            }
+            let mut ev = sys::make_event(mask, fd as u64);
+            let _ = sys::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, fd, &mut ev);
+        }
+        Command::Shutdown(fd, how) => {
+            let _ = sys::shutdown(fd, how);
+        }
+        Command::Close(fd) => sys::close(fd),
+    }
+}
+
+#[cfg_attr(not(feature = "fstack"), allow(dead_code))]
+enum Kind {
+    /// Standard backend: syscalls run inline, readiness on the driver thread.
+    #[cfg_attr(feature = "fstack", allow(dead_code))]
+    Std { epfd: i32 },
+    /// F-Stack backend: everything runs on the stack thread.
+    Fstack { queue: Mutex<VecDeque<Command>> },
+}
+
+/// The I/O platform: where syscalls and event registrations are executed.
+pub(crate) struct Platform {
+    kind: Kind,
+}
+
+impl Platform {
+    #[cfg_attr(feature = "fstack", allow(dead_code))]
+    fn std(epfd: i32) -> Self {
+        Self {
+            kind: Kind::Std { epfd },
+        }
+    }
+
+    #[cfg_attr(not(feature = "fstack"), allow(dead_code))]
+    fn fstack() -> Self {
+        Self {
+            kind: Kind::Fstack {
+                queue: Mutex::new(VecDeque::new()),
+            },
+        }
+    }
+
+    fn dispatch(&self, command: Command) {
+        match &self.kind {
+            Kind::Std { epfd } => apply(*epfd, command),
+            Kind::Fstack { queue } => queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(command),
+        }
+    }
+
+    fn register(&self, fd: i32) {
+        self.dispatch(Command::Register(fd));
+    }
+
+    fn deregister(&self, fd: i32) {
+        self.dispatch(Command::Deregister(fd));
+    }
+
+    fn set_interest(&self, fd: i32, bits: u8) {
+        self.dispatch(Command::Interest(fd, bits));
+    }
+
+    fn close(&self, fd: i32) {
+        self.dispatch(Command::Close(fd));
+    }
+
+    #[cfg(feature = "fstack")]
+    fn drain_queue(&self) -> Vec<Command> {
+        match &self.kind {
+            Kind::Fstack { queue } => queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain(..)
+                .collect(),
+            Kind::Std { .. } => Vec::new(),
+        }
+    }
+}
+
+struct InterestState {
+    bits: u8,
+    closed: bool,
+}
+
+/// Per-socket reactor state.
+pub(crate) struct ScheduledIo {
+    fd: i32,
+    platform: Arc<Platform>,
+    /// Registry owning this entry; used to remove it on close.
+    reactor: Weak<Reactor>,
+    state: Mutex<InterestState>,
+    readiness: AtomicU8,
+    read_waker: Mutex<Option<Waker>>,
+    write_waker: Mutex<Option<Waker>>,
+}
+
+impl ScheduledIo {
+    /// Consume the readiness bit for `direction`.
+    fn take_ready(&self, direction: u8) -> bool {
+        self.readiness.fetch_and(!direction, Ordering::AcqRel) & direction != 0
+    }
+
+    fn waker_slot(&self, direction: u8) -> &Mutex<Option<Waker>> {
+        if direction & READ != 0 {
+            &self.read_waker
+        } else {
+            &self.write_waker
+        }
+    }
+
+    /// Register interest in `direction` with the platform.
+    fn arm(&self, direction: u8) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return;
+        }
+        let next = state.bits | direction;
+        if next != state.bits {
+            state.bits = next;
+            self.platform.set_interest(self.fd, next);
+        }
+    }
+
+    /// Drop interest in `directions` (called by the driver after delivery).
+    fn disarm(&self, directions: u8) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return;
+        }
+        let next = state.bits & !directions;
+        if next != state.bits {
+            state.bits = next;
+            self.platform.set_interest(self.fd, next);
+        }
+    }
+
+    /// Called on the driver thread when epoll reports events for this socket.
+    fn deliver(&self, ready: u8) {
+        self.readiness.fetch_or(ready, Ordering::AcqRel);
+        self.disarm(ready);
+        if ready & READ != 0 {
+            if let Some(waker) = self
+                .read_waker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                waker.wake();
+            }
+        }
+        if ready & WRITE != 0 {
+            if let Some(waker) = self
+                .write_waker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                waker.wake();
+            }
+        }
+    }
+
+    /// Mark the socket closed and release its kernel resources exactly once.
+    fn close(&self) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.closed {
+                return;
+            }
+            state.closed = true;
+            state.bits = 0;
+        }
+        self.platform.deregister(self.fd);
+        self.platform.close(self.fd);
+    }
+}
+
+/// A socket's registration in the reactor.
+pub(crate) struct Io {
+    fd: i32,
+    sched: Arc<ScheduledIo>,
+}
+
+impl Io {
+    /// Register `fd` with the reactor.
+    pub(crate) fn new(fd: i32) -> io::Result<Io> {
+        let reactor = reactor()?;
+        let sched = Arc::new(ScheduledIo {
+            fd,
+            platform: Arc::clone(&reactor.platform),
+            reactor: Arc::downgrade(&reactor),
+            state: Mutex::new(InterestState {
+                bits: 0,
+                closed: false,
+            }),
+            readiness: AtomicU8::new(0),
+            read_waker: Mutex::new(None),
+            write_waker: Mutex::new(None),
+        });
+        reactor
+            .sockets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(fd, sched.clone());
+        reactor.platform.register(fd);
+        Ok(Io { fd, sched })
+    }
+
+    /// The raw file descriptor.
+    pub(crate) fn fd(&self) -> i32 {
+        self.fd
+    }
+
+    /// Wait until the socket is readable.
+    pub(crate) fn readable(&self) -> ReadinessFuture {
+        ReadinessFuture {
+            sched: self.sched.clone(),
+            direction: READ,
+        }
+    }
+
+    /// Wait until the socket is writable.
+    pub(crate) fn writable(&self) -> ReadinessFuture {
+        ReadinessFuture {
+            sched: self.sched.clone(),
+            direction: WRITE,
+        }
+    }
+}
+
+impl Drop for Io {
+    fn drop(&mut self) {
+        if let Some(reactor) = self.sched.reactor.upgrade() {
+            reactor
+                .sockets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.fd);
+        }
+        self.sched.close();
+    }
+}
+
+/// Future returned by [`Io::readable`]/[`Io::writable`].
+pub(crate) struct ReadinessFuture {
+    sched: Arc<ScheduledIo>,
+    direction: u8,
+}
+
+impl ReadinessFuture {
+    /// Poll for readiness. Never returns an error: socket errors surface from
+    /// the subsequent syscall.
+    pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.sched.take_ready(self.direction) {
+            return Poll::Ready(());
+        }
+        // Register the waker before arming, then re-check: an event delivered
+        // in between is observed by the second check.
+        {
+            let slot = self.sched.waker_slot(self.direction);
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(cx.waker().clone());
+        }
+        self.sched.arm(self.direction);
+        if self.sched.take_ready(self.direction) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl std::future::Future for ReadinessFuture {
+    type Output = ();
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        ReadinessFuture::poll(&mut self, cx)
+    }
+}
+
+/// The global reactor.
+pub(crate) struct Reactor {
+    pub(crate) platform: Arc<Platform>,
+    pub(crate) sockets: Mutex<HashMap<i32, Arc<ScheduledIo>>>,
+}
+
+static REACTOR: std::sync::OnceLock<Arc<Reactor>> = std::sync::OnceLock::new();
+static INIT_LOCK: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    /// Reactor of the worker this thread belongs to. Set by [`crate::worker`]
+    /// before the worker's tasks start running.
+    static CURRENT: RefCell<Option<Arc<Reactor>>> = const { RefCell::new(None) };
+}
+
+/// The reactor of the current worker, if the thread runs inside one.
+pub(crate) fn current() -> Option<Arc<Reactor>> {
+    CURRENT.with(|slot| slot.borrow().clone())
+}
+
+/// Bind the current thread to a worker reactor (or clear the binding).
+pub(crate) fn set_current(reactor: Option<Arc<Reactor>>) {
+    CURRENT.with(|slot| *slot.borrow_mut() = reactor);
+}
+
+/// Get the reactor for this thread: the worker's reactor when running inside a
+/// [`crate::worker::Worker`], otherwise the process-wide default reactor.
+///
+/// Initialises the default reactor with a default configuration when the caller
+/// did not call [`crate::init`] first.
+pub(crate) fn reactor() -> io::Result<Arc<Reactor>> {
+    if let Some(reactor) = current() {
+        return Ok(reactor);
+    }
+    if let Some(reactor) = REACTOR.get() {
+        return Ok(Arc::clone(reactor));
+    }
+    crate::init(Config::default())?;
+    REACTOR
+        .get()
+        .map(Arc::clone)
+        .ok_or_else(|| io::Error::other("reactor failed to initialise"))
+}
+
+/// Submit an operation to the platform of the current worker.
+pub(crate) fn dispatch(command: Command) {
+    let reactor = current()
+        .or_else(|| REACTOR.get().map(Arc::clone))
+        .expect("tokio-fstack reactor used before initialisation");
+    reactor.platform.dispatch(command);
+}
+
+/// Close a raw fd that was never registered with the reactor.
+pub(crate) fn close_raw(fd: i32) {
+    if let Some(reactor) = current().or_else(|| REACTOR.get().map(Arc::clone)) {
+        reactor.platform.close(fd);
+    }
+}
+
+/// Shut down part of a connection without waiting for completion.
+pub(crate) fn shutdown(fd: i32, how: i32) {
+    if let Some(reactor) = current().or_else(|| REACTOR.get().map(Arc::clone)) {
+        reactor.platform.dispatch(Command::Shutdown(fd, how));
+    }
+}
+
+/// Start the default reactor. Idempotent.
+pub(crate) fn start(config: Config) -> io::Result<()> {
+    let _guard = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if REACTOR.get().is_some() {
+        return Ok(());
+    }
+    let reactor = build(config)?;
+    let _ = REACTOR.set(reactor);
+    Ok(())
+}
+
+/// Build an independent reactor for a worker.
+///
+/// The caller is responsible for binding it to the worker thread with
+/// [`set_current`].
+pub(crate) fn build_worker(config: Config) -> io::Result<Arc<Reactor>> {
+    build(config)
+}
+
+#[cfg(not(feature = "fstack"))]
+fn build(_config: Config) -> io::Result<Arc<Reactor>> {
+    let epfd = sys::epoll_create()?;
+    let reactor = Arc::new(Reactor {
+        platform: Arc::new(Platform::std(epfd)),
+        sockets: Mutex::new(HashMap::new()),
+    });
+    let driver = Arc::clone(&reactor);
+    std::thread::Builder::new()
+        .name("tokio-fstack-reactor".to_owned())
+        .spawn(move || std_driver(driver))?;
+    Ok(reactor)
+}
+
+#[cfg(feature = "fstack")]
+fn build(config: Config) -> io::Result<Arc<Reactor>> {
+    static FSTACK_STARTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if FSTACK_STARTED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return Err(io::Error::other(
+            "F-Stack supports one stack instance per process; start one worker per process",
+        ));
+    }
+    let reactor = Arc::new(Reactor {
+        platform: Arc::new(Platform::fstack()),
+        sockets: Mutex::new(HashMap::new()),
+    });
+    let worker = Arc::clone(&reactor);
+    let eal_args = config.eal_args;
+    let (tx, rx) = sync_channel(1);
+    std::thread::Builder::new()
+        .name("tokio-fstack-stack".to_owned())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            if let Err(err) = fstack_thread(worker, eal_args, tx) {
+                eprintln!("tokio-fstack: F-Stack thread stopped: {err}");
+            }
+        })?;
+    match rx.recv() {
+        Ok(Ok(())) => Ok(reactor),
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err(io::Error::other(
+            "F-Stack thread exited during initialisation",
+        )),
+    }
+}
+
+/// Turn an epoll event mask into reactor readiness bits.
+fn readiness_of(mask: u32) -> u8 {
+    let err = libc::EPOLLERR as u32;
+    let hup = libc::EPOLLHUP as u32;
+    let mut ready = 0u8;
+    if mask & (libc::EPOLLIN as u32 | hup | err) != 0 {
+        ready |= READ;
+    }
+    if mask & (libc::EPOLLOUT as u32 | hup | err) != 0 {
+        ready |= WRITE;
+    }
+    ready
+}
+
+/// Dispatch one epoll event to its socket.
+fn dispatch_event(sched_registry: &Mutex<HashMap<i32, Arc<ScheduledIo>>>, ev: &sys::EpollEvent) {
+    let ready = readiness_of(sys::event_mask(ev));
+    if ready == 0 {
+        return;
+    }
+    let fd = sys::event_data(ev) as i32;
+    let sched = sched_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&fd)
+        .cloned();
+    if let Some(sched) = sched {
+        sched.deliver(ready);
+    }
+}
+
+#[cfg(not(feature = "fstack"))]
+fn std_driver(reactor: Arc<Reactor>) {
+    let epfd = match &reactor.platform.kind {
+        Kind::Std { epfd } => *epfd,
+        Kind::Fstack { .. } => unreachable!(),
+    };
+    let mut events: Vec<sys::EpollEvent> = (0..256).map(|_| sys::make_event(0, 0)).collect();
+    loop {
+        match sys::epoll_wait(epfd, &mut events, -1) {
+            Ok(count) => {
+                for ev in events.iter().take(count) {
+                    dispatch_event(&reactor.sockets, ev);
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    }
+}
+
+#[cfg(feature = "fstack")]
+use std::sync::mpsc::sync_channel;
+
+#[cfg(feature = "fstack")]
+struct StackContext {
+    reactor: Arc<Reactor>,
+    epfd: i32,
+    events: Vec<sys::EpollEvent>,
+    batch: Vec<Command>,
+}
+
+#[cfg(feature = "fstack")]
+fn fstack_thread(
+    reactor: Arc<Reactor>,
+    eal_args: Vec<String>,
+    ready: std::sync::mpsc::SyncSender<io::Result<()>>,
+) -> io::Result<()> {
+    // argv[0] is the program name, the rest are EAL/F-Stack arguments.
+    let mut args = Vec::with_capacity(eal_args.len() + 1);
+    args.push(
+        std::env::args()
+            .next()
+            .unwrap_or_else(|| "mc-proxy".to_owned()),
+    );
+    args.extend(eal_args);
+    let c_args = sys::cstrings(&args)?;
+    let mut argv: Vec<*const libc::c_char> = c_args.iter().map(|c| c.as_ptr()).collect();
+    argv.push(std::ptr::null());
+
+    if let Err(err) = sys::init(argv.len() as i32 - 1, argv.as_ptr()) {
+        let _ = ready.send(Err(err));
+        return Ok(());
+    }
+    let epfd = match sys::epoll_create() {
+        Ok(fd) => fd,
+        Err(err) => {
+            let _ = ready.send(Err(err));
+            return Ok(());
+        }
+    };
+    let _ = ready.send(Ok(()));
+
+    let ctx = Box::new(StackContext {
+        reactor,
+        epfd,
+        events: (0..512).map(|_| sys::make_event(0, 0)).collect(),
+        batch: Vec::with_capacity(256),
+    });
+    let ctx = Box::into_raw(ctx);
+    // SAFETY: `ctx` is leaked and outlives the (never returning) event loop;
+    // `fstack_tick` only dereferences it from this same thread.
+    unsafe { sys::run(fstack_tick, ctx as *mut libc::c_void) };
+    Ok(())
+}
+
+#[cfg(feature = "fstack")]
+unsafe extern "C" fn fstack_tick(arg: *mut libc::c_void) -> i32 {
+    // SAFETY: `arg` is the leaked `StackContext` created in `fstack_thread`,
+    // and the F-Stack loop runs this callback on that same thread.
+    let ctx = unsafe { &mut *(arg as *mut StackContext) };
+
+    // 1. Run queued syscalls and interest changes.
+    {
+        let mut queue = ctx.reactor.platform.drain_queue();
+        ctx.batch.append(&mut queue);
+    }
+    for command in ctx.batch.drain(..) {
+        apply(ctx.epfd, command);
+    }
+
+    // 2. Poll the F-Stack kqueue (ff_epoll_wait is always non-blocking).
+    if let Ok(count) = sys::epoll_wait(ctx.epfd, &mut ctx.events, 0) {
+        for ev in ctx.events.iter().take(count) {
+            dispatch_event(&ctx.reactor.sockets, ev);
+        }
+    }
+    0
+}

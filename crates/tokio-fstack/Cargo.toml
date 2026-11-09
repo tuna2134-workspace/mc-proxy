@@ -1,0 +1,25 @@
+[package]
+name = "tokio-fstack"
+description = "Tokio-compatible TcpListener/TcpStream/UdpSocket for F-Stack (DPDK) and plain Linux, with a readiness-driven reactor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Build the F-Stack (DPDK) backend. Requires linking against libfstack:
+#   RUSTFLAGS="-L /usr/local/lib -lfstack" cargo build --features fstack
+fstack = []
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[dependencies]
+tokio = { version = "1", default-features = false, features = ["io-util", "net", "rt", "time", "sync"] }
+libc = "0.2"
+core_affinity = "0.8"
+crossbeam-queue = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }

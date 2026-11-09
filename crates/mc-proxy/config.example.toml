@@ -1,0 +1,69 @@
+# mc-proxy example configuration
+#
+# Generate a forwarding secret with:
+#   mc-proxy gen-secret
+# and put the same value into the backend's `velocity.secret`
+# (Paper: config/paper-global.yml -> proxies.velocity.secret).
+
+bind = "0.0.0.0:25565"
+motd = "&a&lmc-proxy\n&7Velocity-compatible reverse proxy"
+max_players = 1000
+version_name = "mc-proxy"
+
+# Number of proxy workers. Each worker owns its own reactor (and, on F-Stack,
+# would own its own stack instance) plus a Tokio runtime, and binds the
+# listener with SO_REUSEPORT. On stock F-Stack multi-core setups run one
+# process per core with workers = 1 (see docs/workers.md).
+workers = 1
+pin_cores = true
+
+# Offline mode accepts any username. Set to true to verify players against
+# the Mojang session server (the backend must still run with online-mode=false
+# and Velocity forwarding enabled).
+online_mode = false
+
+# Compression threshold in bytes; -1 disables compression.
+compression_threshold = 256
+
+# Velocity modern forwarding shared secret. Empty disables forwarding.
+forwarding_secret = ""
+# Alternatively read the secret from a file (trailing whitespace is trimmed):
+# forwarding_secret_file = "/etc/mc-proxy/forwarding.secret"
+
+# Optional 64x64 PNG server icon.
+# favicon = "server-icon.png"
+
+[status]
+# "proxy"   - answer pings with the values above
+# "passthrough" - forward pings to the default backend
+mode = "proxy"
+
+[timeouts]
+handshake_ms = 10000
+login_ms = 30000
+backend_ms = 30000
+
+[auth]
+session_server = "https://sessionserver.mojang.com"
+timeout_ms = 5000
+
+# F-Stack/DPDK EAL arguments. Ignored by the default (kernel socket) build.
+# [fstack]
+# eal_args = ["--conf", "/etc/f-stack.conf", "--proc-type=primary", "--file-prefix=mc-proxy"]
+
+# The first server is the default.
+[[servers]]
+name = "lobby"
+address = "127.0.0.1:25566"
+
+# [[servers]]
+# name = "survival"
+# address = "127.0.0.1:25567"
+
+# Route players based on the hostname they connected to.
+[forced_hosts]
+# "survival.example.com" = "survival"
+
+# Servers to try, in order, when connecting a player.
+[try]
+servers = ["lobby"]
