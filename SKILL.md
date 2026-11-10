@@ -310,10 +310,13 @@ Current test count: 68, plus one network-dependent test (`--ignored`).
 - No cookie request/response relay during login.
 - `max_players` is cosmetic.
 - Client and backend versions must match.
-- F-Stack native-mt (`thread_mode=1`) per-lcore dispatch is not implemented yet;
-  the current F-Stack integration is one stack per process (`workers = 1`), with
-  `ff_init`/`ff_run` owned by the main thread. Scale with one process per core
-  and `SO_REUSEPORT`.
+- F-Stack native-mt (`thread_mode=1`) is implemented behind
+  `[fstack] native_mt = true`: per-lcore reactor/queue/epoll, `workers = N`,
+  stack cores 0..N-1 and app cores N..2N-1. It is experimental: on net_tap the
+  multi-queue flow affinity breaks F-Stack-initiated backend connections
+  (login/relay time out), and status does not scale. Use one process per core
+  with `SO_REUSEPORT` on net_tap/production until validated on a physical NIC
+  with RSS.
 
 ## References
 

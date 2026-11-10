@@ -182,7 +182,26 @@ F-Stack 版は `scripts/run-fstack-net-tap.sh` と同じ手順で net_tap を設
 `idle_sleep` は `/etc/f-stack.conf`（またはコピー）の `[dpdk]` セクションで
 変更します。
 
-## 8. 注意
+## 8. F-Stack native-mt（実験的）
+
+`thread_mode=1`、`lcore_mask=0x3`、`lcore_list=0,1`、2 ワーカー、
+net_tap `queues=2`、スタック 2 コア + アプリ 2 コアで測定:
+
+| クライアント | status | 備考 |
+|---:|---:|---|
+| 4 | 2,615〜2,778 /s | 単一スタック 2,918〜3,150/s と同等 |
+| 8 | 1,895 /s | スケールしない |
+| 16 | 968 /s | 3,512 errors |
+
+- 2 ワーカーとも接続を受けていることは debug ログで確認済み。
+- **net_tap の複数キューはフロー親和性がない**ため、F-Stack から
+  バックエンドへ張った接続の応答が別キューに落ち、login/relay は
+  `backend timed out` になります。status はクライアント起点のため動作します。
+- 物理 NIC + RSS ではキュー分配が変わる可能性がありますが、この環境では
+  検証できていません。net_tap/本番は **1 プロセス 1 コア +
+  `SO_REUSEPORT`** を推奨します。
+
+## 9. 注意
 
 - 8 vCPU の VM、CPU アイソレーションなし、クライアントとバックエンドが
   同一ホストという条件です。絶対値は環境依存です。

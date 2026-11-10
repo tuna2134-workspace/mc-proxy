@@ -405,6 +405,10 @@ cargo run --example echo_client
 送受信バッファ 64KB にすると **login が 517 → 938 /s（約 1.8 倍）**。
 relay / status はスタックスレッドが 1 コアで飽和するため横ばいです。
 
+F-Stack native-mt（`[fstack] native_mt = true`、`thread_mode=1`）の基盤も
+実装しましたが、**net_tap では複数キューのフロー親和性がなく relay が
+成立しない**ため、現状は実験的扱いです。物理 NIC + RSS での検証が必要です。
+
 **マルチコア**は「1 プロセス 1 スタック」でスケールします。2 プロセス
 （別タップ・別 IP・lcore 0/1）で status を並列に流すと
 **2,936 + 2,989 = 5,925 conn/s**（単一プロセスの約 2 倍、エラー 0）。
@@ -416,8 +420,10 @@ relay / status はスタックスレッドが 1 コアで飽和するため横�
 
 ## ワーカーモデル（マルチコア）
 
-以下は per-core worker の構成図です（F-Stack では native-mt の将来像。
-現行の F-Stack バックエンドは 1 プロセス 1 スタックです）。
+以下は per-core worker の構成図です。F-Stack では `[fstack] native_mt = true`
+（`thread_mode=1`）で 1 プロセス N スタックの実験的構成を選べますが、
+net_tap では複数キューのフロー親和性がなく relay が成立しません。
+物理 NIC + RSS での検証が必要です。
 
 ```
 CPU Core 0                                  CPU Core 1
@@ -445,10 +451,10 @@ pin_cores = true   # コアにピン留め（best effort）
 - プレイヤーのログイン/ログアウトはロックフリーのリングバッファ
   （`WorkerBus`）で他の worker に複製され、どの worker が応答する ping でも
   クラスタ全体の人数・サンプルを返します。
-- 標準バックエンドでは 1 プロセスで N worker、F-Stack では
-  **1 プロセス = 1 スタック**のため 1 プロセス 1 worker（N プロセス +
-  `SO_REUSEPORT`）でスケールします。F-Stack v2.0 の native-mt
-  （`thread_mode=1`）への直接対応は今後の課題です。
+- 標準バックエンドでは 1 プロセスで N worker です。F-Stack は
+  `native_mt = true` で 1 プロセス N スタック（実験的、2N コア必要）を
+  選べますが、net_tap では relay が動作しません。net_tap/本番では
+  **1 プロセス 1 worker（N プロセス + `SO_REUSEPORT`）**を推奨します。
 
 詳細と設計上のトレードオフは [docs/workers.md](docs/workers.md) を参照して
 ください。
@@ -564,12 +570,10 @@ Configuration ステートのリレーが実サーバーで動作することが
 - プレイヤー数の上限は `max_players` に強制されません（表示のみ）。
 - レート制限・接続数制限・帯域制限はありません。公開環境では
   ファイアウォールや systemd の制限を併用してください。
-- `workers > 1` は標準バックエンドのみ対応です。F-Stack では
-  1 プロセス 1 worker で複数プロセス起動してください（native-mt 対応は
-  [docs/workers.md](docs/workers.md) の今後の課題）。
-- `workers > 1` は標準バックエンドのみ対応です。F-Stack では
-  1 プロセス 1 worker で複数プロセス起動してください（native-mt 対応は
-  [docs/workers.md](docs/workers.md) の今後の課題）。
+- `workers > 1` は標準バックエンド、または F-Stack の
+  `[fstack] native_mt = true`（実験的、物理 NIC + RSS 必須）で利用できます。
+  net_tap/本番では 1 プロセス 1 worker で複数プロセス起動してください
+  （[docs/workers.md](docs/workers.md)）。
 - F-Stack バックエンドでは DNS 解決にホストカーネルのリゾルバを使います。
 
 ## メンテナンス

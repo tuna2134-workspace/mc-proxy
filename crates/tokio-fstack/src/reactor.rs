@@ -418,6 +418,11 @@ pub(crate) fn shutdown(fd: i32, how: i32) {
 
 /// Start the default reactor. Idempotent.
 pub(crate) fn start(config: Config) -> io::Result<()> {
+    // Inside a native-mt worker the thread-local reactor is already installed;
+    // the global single-stack reactor must not be created.
+    if current().is_some() {
+        return Ok(());
+    }
     let _guard = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if REACTOR.get().is_some() {
         return Ok(());
@@ -530,6 +535,129 @@ pub(crate) fn run_fstack_loop() -> io::Result<()> {
 #[cfg(feature = "fstack")]
 pub(crate) fn stop_fstack_loop() {
     sys::stop_run();
+}
+
+/// One lcore's reactor in native-mt mode.
+#[cfg(feature = "fstack")]
+struct MultiSlot {
+    reactor: Arc<Reactor>,
+    epfd: std::sync::atomic::AtomicI32,
+    batch: Mutex<Vec<Command>>,
+    events: Mutex<Vec<sys::EpollEvent>>,
+}
+
+/// Native-mt context: one reactor per F-Stack lcore.
+#[cfg(feature = "fstack")]
+pub(crate) struct MultiContext {
+    slots: Vec<MultiSlot>,
+}
+
+#[cfg(feature = "fstack")]
+impl MultiContext {
+    pub(crate) fn workers(&self) -> usize {
+        self.slots.len()
+    }
+}
+
+/// Initialise F-Stack in native-mt mode (`thread_mode=1`) on the calling
+/// (main) thread and create one reactor per lcore.
+#[cfg(feature = "fstack")]
+pub(crate) fn init_fstack_multi(workers: usize, config: Config) -> io::Result<Arc<MultiContext>> {
+    if workers == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "f-stack native-mt needs at least one worker",
+        ));
+    }
+    let _guard = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if REACTOR.get().is_some() {
+        return Err(io::Error::other(
+            "F-Stack is already initialised for a single-stack reactor",
+        ));
+    }
+
+    let mut args = Vec::with_capacity(config.eal_args.len() + 1);
+    args.push(
+        std::env::args()
+            .next()
+            .unwrap_or_else(|| "mc-proxy".to_owned()),
+    );
+    args.extend(config.eal_args);
+    let c_args = sys::cstrings(&args)?;
+    let mut argv: Vec<*const libc::c_char> = c_args.iter().map(|c| c.as_ptr()).collect();
+    argv.push(std::ptr::null());
+    sys::init(argv.len() as i32 - 1, argv.as_ptr())?;
+
+    let slots = (0..workers)
+        .map(|_| MultiSlot {
+            reactor: Arc::new(Reactor {
+                platform: Arc::new(Platform::fstack()),
+                sockets: Mutex::new(HashMap::new()),
+            }),
+            epfd: std::sync::atomic::AtomicI32::new(-1),
+            batch: Mutex::new(Vec::with_capacity(256)),
+            events: Mutex::new((0..512).map(|_| sys::make_event(0, 0)).collect()),
+        })
+        .collect();
+    Ok(Arc::new(MultiContext { slots }))
+}
+
+/// Reactor belonging to worker `index` in native-mt mode.
+#[cfg(feature = "fstack")]
+pub(crate) fn multi_reactor(ctx: &MultiContext, index: usize) -> Arc<Reactor> {
+    Arc::clone(&ctx.slots[index].reactor)
+}
+
+/// Run the native-mt F-Stack loop until `ff_stop_run`.
+#[cfg(feature = "fstack")]
+pub(crate) fn run_fstack_multi(ctx: Arc<MultiContext>) -> io::Result<()> {
+    let raw = Arc::into_raw(ctx);
+    // SAFETY: the context is kept alive by the raw Arc for the whole loop;
+    // each lcore only touches its own slot.
+    unsafe { sys::run(multi_tick, raw as *mut libc::c_void) };
+    // SAFETY: `ff_run` has returned, so no lcore can touch the context.
+    unsafe { drop(Arc::from_raw(raw)) };
+    Ok(())
+}
+
+#[cfg(feature = "fstack")]
+unsafe extern "C" fn multi_tick(arg: *mut libc::c_void) -> i32 {
+    // SAFETY: `arg` is the leaked MultiContext created by run_fstack_multi.
+    let ctx = unsafe { &*(arg as *const MultiContext) };
+    let index = sys::cur_proc_id();
+    if index < 0 || index as usize >= ctx.slots.len() {
+        return 0;
+    }
+    let slot = &ctx.slots[index as usize];
+
+    let mut epfd = slot.epfd.load(std::sync::atomic::Ordering::Relaxed);
+    if epfd < 0 {
+        match sys::epoll_create() {
+            Ok(fd) => {
+                slot.epfd.store(fd, std::sync::atomic::Ordering::Relaxed);
+                epfd = fd;
+            }
+            Err(_) => return 0,
+        }
+    }
+
+    {
+        let mut batch = slot.batch.lock().unwrap_or_else(|e| e.into_inner());
+        let mut queue = slot.reactor.platform.drain_queue();
+        batch.append(&mut queue);
+        for command in batch.drain(..) {
+            apply(epfd, command);
+        }
+    }
+    {
+        let mut events = slot.events.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(count) = sys::epoll_wait(epfd, &mut events, 0) {
+            for ev in events.iter().take(count) {
+                dispatch_event(&slot.reactor.sockets, ev);
+            }
+        }
+    }
+    0
 }
 
 /// Turn an epoll event mask into reactor readiness bits.

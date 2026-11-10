@@ -81,6 +81,27 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // F-Stack native-mt: one stack per lcore, one application worker per
+    // stack. ff_init/ff_run must stay on the main thread, so this path cannot
+    // go through Proxy::bind's Tokio runtime.
+    #[cfg(feature = "fstack")]
+    if config.workers > 1 {
+        if !config.fstack.native_mt {
+            error!(
+                "workers > 1 on F-Stack requires [fstack] native_mt = true                  (thread_mode=1, one stack per lcore, physical NIC with RSS); \
+                 otherwise run one process per core with workers = 1"
+            );
+            return ExitCode::FAILURE;
+        }
+        return match mc_proxy::proxy::run_fstack_multi(config) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                error!("proxy stopped: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // F-Stack requires ff_init/ff_run on the main thread. run_with_stack
     // takes care of both backends: on the standard backend it just calls the
     // closure; on F-Stack it initialises on this thread, runs the application

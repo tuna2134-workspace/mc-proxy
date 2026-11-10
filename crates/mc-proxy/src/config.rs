@@ -106,6 +106,11 @@ pub struct FstackConfig {
     /// Arguments passed to `ff_init`, e.g.
     /// `["--conf", "/etc/f-stack.conf", "--proc-type=primary"]`.
     pub eal_args: Vec<String>,
+    /// Enable F-Stack native-mt (`thread_mode=1`): one stack instance per
+    /// lcore, with `workers` application workers. Experimental; requires a
+    /// multi-queue NIC (a physical NIC with RSS, not net_tap) and 2*workers
+    /// CPUs.
+    pub native_mt: bool,
 }
 
 /// The `[try]` table: servers to try in order when a player connects.

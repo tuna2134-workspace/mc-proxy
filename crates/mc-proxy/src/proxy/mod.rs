@@ -313,11 +313,78 @@ impl Proxy {
     }
 }
 
+/// Run the proxy in F-Stack native-mt mode (`thread_mode=1`).
+///
+/// One worker is started per lcore selected by `lcore_mask`; each worker has
+/// its own F-Stack stack instance, reactor, epoll fd and SO_REUSEPORT
+/// listener. `ff_init`/`ff_run` stay on the main thread.
+#[cfg(feature = "fstack")]
+pub fn run_fstack_multi(config: Config) -> Result<(), ProxyError> {
+    config.validate()?;
+    let count = config.workers.max(1);
+    if count < 2 {
+        return Err(ConfigError::Invalid(
+            "run_fstack_multi requires workers >= 2; use Proxy::bind for one worker".into(),
+        )
+        .into());
+    }
+    if config.bind.ends_with(":0") {
+        return Err(ConfigError::Invalid(
+            "workers > 1 on F-Stack requires a concrete bind port (not :0)".into(),
+        )
+        .into());
+    }
+
+    let immutable = Arc::new(build_immutable(&config)?);
+    let (bus, receivers) = WorkerBus::<ClusterMessage>::new(count, 4096);
+    let bus = Arc::new(bus);
+    let receivers = Arc::new(Mutex::new(receivers.into_iter()));
+    let bind = config.bind.clone();
+    let stack_config =
+        tokio_fstack::Config::default().with_eal_args(config.fstack.eal_args.clone());
+
+    tracing::info!(
+        backend = "f-stack",
+        workers = count,
+        listen = %bind,
+        "mc-proxy started (native-mt)"
+    );
+
+    tokio_fstack::run_with_stack_workers(count, stack_config, move |id| {
+        let immutable = Arc::clone(&immutable);
+        let bus = Arc::clone(&bus);
+        let bind = bind.clone();
+        let receiver = receivers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next()
+            .expect("one inbox per worker");
+        let shared = Arc::new(Shared::new(immutable, id, Some(bus.sender())));
+        async move {
+            let bus_shared = Arc::clone(&shared);
+            tokio::spawn(async move {
+                loop {
+                    bus_shared.apply_cluster_message(receiver.recv().await);
+                }
+            });
+            let listener = TcpListener::bind_reuseport(&bind).await?;
+            tracing::info!(
+                worker = id,
+                listen = %listener.local_addr()?,
+                "F-Stack worker listening"
+            );
+            serve(listener, shared).await
+        }
+    })?;
+    Ok(())
+}
+
 /// Accept connections and spawn a session per connection.
 pub(crate) async fn serve(listener: TcpListener, shared: Arc<Shared>) -> std::io::Result<()> {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                tracing::debug!(worker = shared.worker_id, %peer, "accepted connection");
                 let shared = Arc::clone(&shared);
                 tokio::spawn(async move {
                     session::handle(stream, peer, shared).await;

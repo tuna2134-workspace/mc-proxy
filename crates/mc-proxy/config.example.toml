@@ -10,10 +10,12 @@ motd = "&a&lmc-proxy\n&7Velocity-compatible reverse proxy"
 max_players = 1000
 version_name = "mc-proxy"
 
-# Number of proxy workers. Each worker owns its own reactor (and, on F-Stack,
-# would own its own stack instance) plus a Tokio runtime, and binds the
-# listener with SO_REUSEPORT. On stock F-Stack multi-core setups run one
-# process per core with workers = 1 (see docs/workers.md).
+# Number of proxy workers. Each worker owns its own reactor plus a Tokio
+# runtime, and binds the listener with SO_REUSEPORT.
+#   Kernel backend: workers = N (up to the number of cores).
+#   F-Stack:        workers = 1 and one process per core (recommended), or
+#                   workers = N with [fstack] native_mt = true (experimental;
+#                   needs thread_mode=1, 2*N CPUs and a physical NIC with RSS).
 workers = 1
 pin_cores = true
 
@@ -49,7 +51,11 @@ timeout_ms = 5000
 
 # F-Stack/DPDK EAL arguments. Ignored by the default (kernel socket) build.
 # [fstack]
-# eal_args = ["--conf", "/etc/f-stack.conf", "--proc-type=primary", "--file-prefix=mc-proxy"]
+# eal_args = ["--conf", "/etc/f-stack.conf", "--proc-type=primary"]
+# Experimental: F-Stack native-mt (thread_mode=1), one stack per lcore.
+# Requires 2*workers CPUs and a physical NIC with RSS; not supported on net_tap
+# for backend connections. Leave false for one process per core.
+# native_mt = false
 
 # The first server is the default.
 [[servers]]

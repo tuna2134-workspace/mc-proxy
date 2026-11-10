@@ -170,7 +170,7 @@ where
     })
 }
 
-fn pin_to_core(index: usize) {
+pub(crate) fn pin_to_core(index: usize) {
     let Some(cores) = core_affinity::get_core_ids() else {
         return;
     };

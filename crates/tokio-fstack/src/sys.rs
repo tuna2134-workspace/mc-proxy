@@ -394,6 +394,7 @@ mod imp {
     extern "C" {
         pub(crate) fn ff_init(argc: c_int, argv: *const *const libc::c_char) -> c_int;
         fn ff_stop_run();
+        fn ff_cur_proc_id() -> c_int;
         pub(crate) fn ff_run(
             callback: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
             arg: *mut c_void,
@@ -681,6 +682,12 @@ mod imp {
         }
     }
 
+    /// Dense per-thread stack index (0..nb_threads) for native-mt.
+    pub(crate) fn cur_proc_id() -> c_int {
+        // SAFETY: F-Stack returns the calling lcore's dense proc id.
+        unsafe { ff_cur_proc_id() }
+    }
+
     /// Ask the F-Stack main loop to stop (thread-safe).
     pub(crate) fn stop_run() {
         // SAFETY: `ff_stop_run` only sets a stop flag in the F-Stack loop.
@@ -732,4 +739,4 @@ pub(crate) use imp::{
     getsockopt_int, listen, recv, recv_from, send, send_to, setsockopt_int, shutdown, socket,
 };
 #[cfg(feature = "fstack")]
-pub(crate) use imp::{cstrings, init, run, stop_run};
+pub(crate) use imp::{cstrings, cur_proc_id, init, run, stop_run};
