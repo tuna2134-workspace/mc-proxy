@@ -85,6 +85,9 @@ enum Kind {
     Std { epfd: i32 },
     /// F-Stack backend: everything runs on the F-Stack thread.
     Fstack { queue: Mutex<VecDeque<Command>> },
+    /// F-Stack native-mt: syscalls run inline on the owning lcore.
+    #[cfg(feature = "fstack")]
+    FstackInline { epfd: std::sync::atomic::AtomicI32 },
 }
 
 /// The I/O platform: where syscalls and event registrations are executed.
@@ -109,6 +112,22 @@ impl Platform {
         }
     }
 
+    #[cfg(feature = "fstack")]
+    fn fstack_inline() -> Self {
+        Self {
+            kind: Kind::FstackInline {
+                epfd: std::sync::atomic::AtomicI32::new(-1),
+            },
+        }
+    }
+
+    #[cfg(feature = "fstack")]
+    fn set_inline_epfd(&self, fd: i32) {
+        if let Kind::FstackInline { epfd } = &self.kind {
+            epfd.store(fd, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn dispatch(&self, command: Command) {
         match &self.kind {
             Kind::Std { epfd } => apply(*epfd, command),
@@ -116,6 +135,13 @@ impl Platform {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push_back(command),
+            #[cfg(feature = "fstack")]
+            Kind::FstackInline { epfd } => {
+                let epfd = epfd.load(std::sync::atomic::Ordering::Relaxed);
+                if epfd >= 0 {
+                    apply(epfd, command);
+                }
+            }
         }
     }
 
@@ -143,7 +169,7 @@ impl Platform {
                 .unwrap_or_else(|e| e.into_inner())
                 .drain(..)
                 .collect(),
-            Kind::Std { .. } => Vec::new(),
+            Kind::FstackInline { .. } | Kind::Std { .. } => Vec::new(),
         }
     }
 }
@@ -537,19 +563,25 @@ pub(crate) fn stop_fstack_loop() {
     sys::stop_run();
 }
 
-/// One lcore's reactor in native-mt mode.
+/// One lcore's state in native-mt mode.
 #[cfg(feature = "fstack")]
-struct MultiSlot {
+type InlineSetup = Box<dyn FnOnce() -> Box<dyn FnMut() + Send> + Send>;
+
+#[cfg(feature = "fstack")]
+struct InlineSlot {
     reactor: Arc<Reactor>,
     epfd: std::sync::atomic::AtomicI32,
-    batch: Mutex<Vec<Command>>,
     events: Mutex<Vec<sys::EpollEvent>>,
+    /// Called once on the lcore: builds the Tokio runtime and spawns the app.
+    setup: Mutex<Option<InlineSetup>>,
+    /// Drives the lcore's Tokio runtime from the F-Stack loop.
+    pump: Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 
-/// Native-mt context: one reactor per F-Stack lcore.
+/// Native-mt context: one inline reactor/runtime per F-Stack lcore.
 #[cfg(feature = "fstack")]
 pub(crate) struct MultiContext {
-    slots: Vec<MultiSlot>,
+    slots: Vec<InlineSlot>,
 }
 
 #[cfg(feature = "fstack")]
@@ -560,7 +592,9 @@ impl MultiContext {
 }
 
 /// Initialise F-Stack in native-mt mode (`thread_mode=1`) on the calling
-/// (main) thread and create one reactor per lcore.
+/// (main) thread. Application code is not spawned here: the first tick on
+/// each lcore creates that lcore's Tokio runtime, so all `ff_*` calls and all
+/// socket I/O stay on the owning lcore thread.
 #[cfg(feature = "fstack")]
 pub(crate) fn init_fstack_multi(workers: usize, config: Config) -> io::Result<Arc<MultiContext>> {
     if workers == 0 {
@@ -589,17 +623,27 @@ pub(crate) fn init_fstack_multi(workers: usize, config: Config) -> io::Result<Ar
     sys::init(argv.len() as i32 - 1, argv.as_ptr())?;
 
     let slots = (0..workers)
-        .map(|_| MultiSlot {
+        .map(|_| InlineSlot {
             reactor: Arc::new(Reactor {
-                platform: Arc::new(Platform::fstack()),
+                platform: Arc::new(Platform::fstack_inline()),
                 sockets: Mutex::new(HashMap::new()),
             }),
             epfd: std::sync::atomic::AtomicI32::new(-1),
-            batch: Mutex::new(Vec::with_capacity(256)),
             events: Mutex::new((0..512).map(|_| sys::make_event(0, 0)).collect()),
+            setup: Mutex::new(None),
+            pump: Mutex::new(None),
         })
         .collect();
     Ok(Arc::new(MultiContext { slots }))
+}
+
+/// Install the per-lcore setup closure (runtime + application future).
+#[cfg(feature = "fstack")]
+pub(crate) fn set_inline_setup(ctx: &MultiContext, index: usize, setup: InlineSetup) {
+    *ctx.slots[index]
+        .setup
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(setup);
 }
 
 /// Reactor belonging to worker `index` in native-mt mode.
@@ -635,20 +679,23 @@ unsafe extern "C" fn multi_tick(arg: *mut libc::c_void) -> i32 {
         match sys::epoll_create() {
             Ok(fd) => {
                 slot.epfd.store(fd, std::sync::atomic::Ordering::Relaxed);
+                slot.reactor.platform.set_inline_epfd(fd);
                 epfd = fd;
             }
             Err(_) => return 0,
         }
     }
 
+    // First tick on this lcore: create the Tokio runtime and start the app.
     {
-        let mut batch = slot.batch.lock().unwrap_or_else(|e| e.into_inner());
-        let mut queue = slot.reactor.platform.drain_queue();
-        batch.append(&mut queue);
-        for command in batch.drain(..) {
-            apply(epfd, command);
+        let mut setup = slot.setup.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(setup) = setup.take() {
+            let pump = setup();
+            *slot.pump.lock().unwrap_or_else(|e| e.into_inner()) = Some(pump);
         }
     }
+
+    // Deliver readiness events, then run the lcore's Tokio tasks inline.
     {
         let mut events = slot.events.lock().unwrap_or_else(|e| e.into_inner());
         if let Ok(count) = sys::epoll_wait(epfd, &mut events, 0) {
@@ -656,6 +703,9 @@ unsafe extern "C" fn multi_tick(arg: *mut libc::c_void) -> i32 {
                 dispatch_event(&slot.reactor.sockets, ev);
             }
         }
+    }
+    if let Some(pump) = slot.pump.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        pump();
     }
     0
 }

@@ -185,21 +185,18 @@ F-Stack 版は `scripts/run-fstack-net-tap.sh` と同じ手順で net_tap を設
 ## 8. F-Stack native-mt（実験的）
 
 `thread_mode=1`、`lcore_mask=0x3`、`lcore_list=0,1`、2 ワーカー、
-net_tap `queues=2`、スタック 2 コア + アプリ 2 コアで測定:
+net_tap `queues=2` で、1 lcore = 1 スレッドのインライン実行を検証:
 
-| クライアント | status | 備考 |
-|---:|---:|---|
-| 4 | 2,615〜2,778 /s | 単一スタック 2,918〜3,150/s と同等 |
-| 8 | 1,895 /s | スケールしない |
-| 16 | 968 /s | 3,512 errors |
+- 2 ワーカーの起動と SO_REUSEPORT bind は成功（worker 0/1）。
+- status を 4 スレッド以上で流すと **segfault**。
+- login/relay は `backend timed out`（F-Stack 起点の接続応答が別 RX
+  キューに配送されるため）。
+- キュー方式で先に試した構成でも 4 スレッド 2,615〜2,778/s で
+  単一スタック（2,918〜3,150/s）を超えず、8/16 スレッドで低下・エラー。
 
-- 2 ワーカーとも接続を受けていることは debug ログで確認済み。
-- **net_tap の複数キューはフロー親和性がない**ため、F-Stack から
-  バックエンドへ張った接続の応答が別キューに落ち、login/relay は
-  `backend timed out` になります。status はクライアント起点のため動作します。
-- 物理 NIC + RSS ではキュー分配が変わる可能性がありますが、この環境では
-  検証できていません。net_tap/本番は **1 プロセス 1 コア +
-  `SO_REUSEPORT`** を推奨します。
+**net_tap は native-mt の検証・運用環境として不適切**です。物理 NIC +
+DPDK RSS で、双方向フローが同一キューに届く構成が必要です。net_tap/
+本番では 1 プロセス 1 コア + `SO_REUSEPORT` を推奨します。
 
 ## 9. 注意
 

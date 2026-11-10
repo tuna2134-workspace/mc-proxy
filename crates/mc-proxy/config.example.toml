@@ -52,9 +52,10 @@ timeout_ms = 5000
 # F-Stack/DPDK EAL arguments. Ignored by the default (kernel socket) build.
 # [fstack]
 # eal_args = ["--conf", "/etc/f-stack.conf", "--proc-type=primary"]
-# Experimental: F-Stack native-mt (thread_mode=1), one stack per lcore.
-# Requires 2*workers CPUs and a physical NIC with RSS; not supported on net_tap
-# for backend connections. Leave false for one process per core.
+# Experimental: F-Stack native-mt (thread_mode=1), one thread per lcore.
+# Requires workers CPUs and a physical NIC with RSS. net_tap is not supported
+# (multi-queue flow affinity breaks backend connections). Leave false for one
+# process per core.
 # native_mt = false
 
 # The first server is the default.

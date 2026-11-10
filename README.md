@@ -405,9 +405,10 @@ cargo run --example echo_client
 送受信バッファ 64KB にすると **login が 517 → 938 /s（約 1.8 倍）**。
 relay / status はスタックスレッドが 1 コアで飽和するため横ばいです。
 
-F-Stack native-mt（`[fstack] native_mt = true`、`thread_mode=1`）の基盤も
-実装しましたが、**net_tap では複数キューのフロー親和性がなく relay が
-成立しない**ため、現状は実験的扱いです。物理 NIC + RSS での検証が必要です。
+F-Stack native-mt（`[fstack] native_mt = true`、`thread_mode=1`）は
+**1 lcore = 1 スレッド**のインライン実行基盤を実装済みですが、
+net_tap では複数キュー負荷時に segfault し、relay も成立しません。
+**物理 NIC + RSS が必須**で、現状は実験的扱いです。
 
 **マルチコア**は「1 プロセス 1 スタック」でスケールします。2 プロセス
 （別タップ・別 IP・lcore 0/1）で status を並列に流すと
@@ -452,7 +453,7 @@ pin_cores = true   # コアにピン留め（best effort）
   （`WorkerBus`）で他の worker に複製され、どの worker が応答する ping でも
   クラスタ全体の人数・サンプルを返します。
 - 標準バックエンドでは 1 プロセスで N worker です。F-Stack は
-  `native_mt = true` で 1 プロセス N スタック（実験的、2N コア必要）を
+  `native_mt = true` で 1 プロセス N スタック（実験的、N コア）を
   選べますが、net_tap では relay が動作しません。net_tap/本番では
   **1 プロセス 1 worker（N プロセス + `SO_REUSEPORT`）**を推奨します。
 

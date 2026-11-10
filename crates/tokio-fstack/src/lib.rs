@@ -197,11 +197,11 @@ where
 /// worker per lcore.
 ///
 /// `ff_init` runs on the calling (main) thread, `factory(id)` runs on a
-/// dedicated thread pinned to core `id + workers` (the stack lcores are
-/// `0..workers`), and `ff_run` drives one reactor per lcore. Each worker owns
-/// its own queue and epoll instance, so sockets are worker-affine and never
-/// cross a shared reactor. This needs `2 * workers` CPUs when pinning is
-/// available.
+/// same lcore thread: the first tick on each lcore creates that lcore's
+/// Tokio `current_thread` runtime and schedules the application future, and
+/// every subsequent tick drives it. Socket syscalls execute inline on the
+/// owning lcore (no cross-thread op queue), and sockets never move between
+/// lcores. Only `workers` CPUs are needed.
 ///
 /// The F-Stack configuration must enable `thread_mode=1` and select the same
 /// number of lcores (for example `lcore_mask=0x3` and `lcore_list=0,1` for two
@@ -211,7 +211,7 @@ where
 pub fn run_with_stack_workers<F, Fut>(workers: usize, config: Config, factory: F) -> io::Result<()>
 where
     F: Fn(usize) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = io::Result<()>> + 'static,
+    Fut: std::future::Future<Output = io::Result<()>> + Send + 'static,
 {
     let ctx = reactor::init_fstack_multi(workers, config)?;
     if ctx.workers() != workers {
@@ -220,43 +220,41 @@ where
         ));
     }
     let factory = std::sync::Arc::new(factory);
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers + 1));
     let (result_tx, result_rx) = std::sync::mpsc::channel();
 
     for id in 0..workers {
         let reactor = reactor::multi_reactor(&ctx, id);
         let factory = std::sync::Arc::clone(&factory);
-        let barrier = std::sync::Arc::clone(&barrier);
         let result_tx = result_tx.clone();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .thread_name(format!("mc-proxy-worker-{id}"))
-            .build()?;
-        std::thread::Builder::new()
-            .name(format!("mc-proxy-worker-{id}"))
-            .stack_size(2 * 1024 * 1024)
-            .spawn(move || {
-                // Stack lcores occupy 0..workers; application workers get
-                // their own cores so the busy-polling stack loop cannot
-                // starve the Tokio side.
-                worker::pin_to_core(id + workers);
-                reactor::set_current(Some(reactor));
-                barrier.wait();
-                let result = runtime.block_on(factory(id));
-                reactor::set_current(None);
-                let _ = result_tx.send((id, result));
-                // Stop all lcores; the loop returns on the main thread.
-                reactor::stop_fstack_loop();
-            })?;
+        reactor::set_inline_setup(
+            &ctx,
+            id,
+            Box::new(move || {
+                reactor::set_current(Some(std::sync::Arc::clone(&reactor)));
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("per-lcore Tokio runtime");
+                let task_reactor = std::sync::Arc::clone(&reactor);
+                runtime.spawn(async move {
+                    let result = factory(id).await;
+                    let _ = result_tx.send((id, result));
+                    reactor::stop_fstack_loop();
+                    let _ = task_reactor;
+                });
+                // One yield per F-Stack loop pass lets the runtime poll every
+                // ready task and run socket futures inline on this lcore.
+                Box::new(move || {
+                    let _ = runtime.block_on(async {
+                        tokio::task::yield_now().await;
+                    });
+                }) as Box<dyn FnMut() + Send>
+            }),
+        );
     }
     drop(result_tx);
 
-    // All workers are ready; enter the per-lcore F-Stack loop on this thread.
-    barrier.wait();
     let loop_result = reactor::run_fstack_multi(ctx);
-
-    // A worker that failed at startup sends its result before stopping the
-    // loop, so this is already queued when ff_run returns.
     let results: Vec<(usize, io::Result<()>)> = result_rx.try_iter().collect();
     loop_result?;
     for (id, result) in results {

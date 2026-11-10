@@ -101,17 +101,22 @@ RX/TX キューと fd テーブルを持ちます。まさにこのドキュメ�
 `thread_mode=1` の設定で、1 プロセス内に lcore ごとのスタック・リアクター・
 epoll・キューを作り、`workers = N` のアプリワーカーを動かします。
 
-- スタック lcore: `0..N-1`、アプリワーカー: `N..2N-1` にピン留め
-  （**2N コア**が必要）。
+- **1 lcore = 1 スレッド**。各 lcore の最初の tick でその lcore 上に
+  Tokio `current_thread` ランタイムを作り、アプリ Future を spawn します。
+- 以降の tick でランタイムを駆動し、`ff_*` はすべて所有 lcore 上で
+  **インライン実行**（Op キュー・アプリ用別スレッドなし）。
 - `ff_init`/`ff_run` はメインスレッドのまま。`ff_cur_proc_id()` で
-  lcore ごとのスロットを選び、その lcore の epoll とキューだけを処理。
+  lcore ごとのスロットを選び、その lcore の epoll だけを処理。
+- 必要なコア数は **N**（アプリ用の追加コア不要）。
 - **net_tap では relay が成立しません**。net_tap の複数キューはフロー
   親和性がなく、F-Stack からバックエンドへ張った接続の応答が別キューに
   配送されるためです。物理 NIC + RSS が必要です。
-- 検証では status は 4 スレッドで 2,615〜2,778/s（単一スタックの
-  2,918〜3,150/s と同等）でしたが、8 スレッドで 1,895/s、16 スレッドで
-  968/s + エラーとスケールしませんでした。**net_tap/本番では
-  1 プロセス 1 コア + `SO_REUSEPORT` を推奨**します。
+- net_tap での検証: 2 ワーカーの起動・bind は成功しますが、
+  status 負荷（4 スレッド以上）で **segfault** し、login/relay は
+  `backend timed out` になります。net_tap の複数キューはフロー親和性が
+  なく、F-Stack 起点の接続の応答が別キューに落ちるためです。
+- **物理 NIC + DPDK RSS が必須**です。net_tap/本番では
+  1 プロセス 1 コア + `SO_REUSEPORT` を推奨します。
 
 単一スタック構成では、メインスレッドが `ff_init`/`ff_run` を実行し、
 プロキシの Tokio ランタイムは別スレッドで動いて syscall をキュー経由で
@@ -204,10 +209,9 @@ reactor / F-Stack スレッド（同じ core にピン留め可能）
 
 ## 8. 制限と今後の課題
 
-- **F-Stack native-mt**: 基盤（per-lcore リアクター/キュー/epoll、
-  `workers = N`）は実装済みですが、net_tap のキュー親和性の問題で relay が
-  動作せず、スケールもしません。物理 NIC + RSS 環境での検証と、
-  RSS 設定・キュー分配のチューニングが次の課題です。
+- **F-Stack native-mt**: 1 lcore = 1 スレッドのインライン実行基盤は
+  実装済みですが、net_tap では複数キュー負荷時に segfault し、relay も
+  成立しません。物理 NIC + RSS 環境での検証が必須です。
 - **マルチプロセス間の WorkerBus**: 現在のリングバッファは同一プロセス内。
   DPDK `rte_ring`（共有 hugepage）版を追加すると、マルチプロセス
   デプロイでもプレイヤー状態を共有できます。

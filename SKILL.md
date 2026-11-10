@@ -311,12 +311,13 @@ Current test count: 68, plus one network-dependent test (`--ignored`).
 - `max_players` is cosmetic.
 - Client and backend versions must match.
 - F-Stack native-mt (`thread_mode=1`) is implemented behind
-  `[fstack] native_mt = true`: per-lcore reactor/queue/epoll, `workers = N`,
-  stack cores 0..N-1 and app cores N..2N-1. It is experimental: on net_tap the
-  multi-queue flow affinity breaks F-Stack-initiated backend connections
-  (login/relay time out), and status does not scale. Use one process per core
-  with `SO_REUSEPORT` on net_tap/production until validated on a physical NIC
-  with RSS.
+  `[fstack] native_mt = true`: one thread per lcore, the first tick creates a
+  Tokio current_thread runtime and all socket I/O executes inline on that
+  lcore (no op queue or app threads). It needs N cores. It is experimental:
+  on net_tap it segfaults under multi-thread status load and F-Stack-initiated
+  backend connections time out (multi-queue flow affinity). A physical NIC
+  with RSS is mandatory; use one process per core with SO_REUSEPORT
+  otherwise.
 
 ## References
 
